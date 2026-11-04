@@ -31,6 +31,7 @@ export interface PublicGame {
   ms: Record<string, number>;
   c: PublicChoice | null;
   res: { id: string; ok: boolean } | null;
+  fq: { text?: string; answer?: string } | null; // free question (host only)
 }
 
 export type ClientMsg =

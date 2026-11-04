@@ -48,10 +48,11 @@
         <div class="bar" hidden><i></i></div>
       </div>
       <div id="h-choices"></div>
+      <div id="p-prog" class="host-progress" hidden></div>
       <div class="actions host-actions">
         <div class="host-group">
           <button id="h-start" title="クイズ形式を使わずに早押しボタンを有効にします">自由早押し</button>
-          <button id="h-ox" class="btn-ox" title="〇×クイズを開始します">〇×</button>
+          <!-- <button id="h-ox" class="btn-ox" title="〇×クイズを開始します">〇×</button> -->
           <button id="h-show-q">問題表示</button>
           <button id="h-show-c">回答開始</button>
         </div>
@@ -78,7 +79,8 @@
         <summary>出題済み</summary>
         <ul id="q-asked"></ul>
       </details>
-      <h3>問題リスト <button id="q-add">追加</button></h3>
+      <h3>問題リスト <button id="q-add">追加</button> <button id="q-import-btn">CSV取込</button></h3>
+      <input id="q-import" type="file" accept=".csv,.txt" hidden><small id="q-import-msg"></small>
       <ul id="qlist"></ul>
     </div>
     <details id="log-details">
@@ -90,8 +92,9 @@
 <script type="module" src="/src/client/main.ts"></script>
 <dialog id="qedit">
   <div class="qe">
-    <label>形式 <select id="qe-type"><option value="choice">選択</option><option value="kana">半回答</option></select></label>
+    <label>形式 <select id="qe-type"><option value="free">自由</option><option value="choice">選択</option><option value="kana">半回答</option></select></label>
     <input id="qe-text" placeholder="問題文">
+    <input id="qe-ans" placeholder="解答テキスト(表示用・任意)">
     <div id="qe-choice" class="qe">
       <input class="qe-c" placeholder="選択肢1"><input class="qe-c" placeholder="選択肢2">
       <input class="qe-c" placeholder="選択肢3"><input class="qe-c" placeholder="選択肢4">
