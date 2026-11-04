@@ -27,11 +27,13 @@ export interface PublicGame {
   answerer: string | null;
   queue: string[];
   locked: string[];
-  pts: Record<string, number>;
   ms: Record<string, number>;
   c: PublicChoice | null;
   res: { id: string; ok: boolean } | null;
   fq: { text?: string; answer?: string } | null; // free question (host only)
+  order: string[]; // press order (scoreboard pin)
+  pts: Record<string, number>; // correct count (tiebreak)
+  sc: Record<string, number>;  // score
 }
 
 export type ClientMsg =
@@ -40,7 +42,7 @@ export type ClientMsg =
   | { type: "start" }
   | { type: "end" }
   | { type: "buzz"; at: number }
-  | { type: "judge"; ok: boolean }
+  | { type: "judge"; ok: boolean; score?: number }
   | { type: "ask"; q: Q }
   | { type: "cmd"; cmd: "show" | "choices" | "close" | "reveal"; correct?: number }
   | { type: "answer"; choice: number; d: number }
@@ -73,6 +75,6 @@ export interface PublicChoice {
   limitMs: number; leftMs: number;
   answered: string[];
   counts?: number[]; correct?: number; answer?: string;
-  results?: Record<string, { ok: boolean; ms: number }>;
+  results?: Record<string, { ok: boolean; ms: number; sc?: number }>;
   startLeftMs?: number; max?: number; ks?: Record<string, { s: "play" | "done" | "fail"; p: number; total: number; v?: string }>;
 }

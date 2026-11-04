@@ -1,4 +1,4 @@
-import type { FreeQ, KanaStep, RunQ } from "../shared/quiz";
+import {FreeQ, KanaStep, RunQ, scoreAt} from "../shared/quiz";
 
 export const GRACE_MS = 300; // accept after deadline (latency)
 const TOL_MS = 500; // client/server time gap tolerance
@@ -9,6 +9,7 @@ export interface Buzz {
 }
 
 export type CPhase = "ready" | "shown" | "streaming" | "answering" | "closed" | "revealed";
+
 export interface KProg {
   step: number;
   keys: string[];
@@ -19,6 +20,7 @@ export interface KProg {
   due: number;
   cur: string;
 }
+
 export interface ChoiceRun {
   q: RunQ;
   phase: CPhase;
@@ -28,7 +30,8 @@ export interface ChoiceRun {
   answers: Record<string, { choice: number; ms: number }>; // choice
   prog: Record<string, KProg>; // kana
   counts: number[];
-  results: Record<string, { ok: boolean; ms: number }>;
+  results: Record<string, { ok: boolean; ms: number; sc: number }>;
+  stopPos?: number;
 }
 
 function shuffle<T>(a: T[]): T[] {
@@ -38,6 +41,7 @@ function shuffle<T>(a: T[]): T[] {
   }
   return a;
 }
+
 const keysOf = (s: KanaStep) => shuffle([s.correct, ...s.dummies]);
 const len = (s: string) => Array.from(s).length;
 
@@ -59,6 +63,8 @@ export interface Game {
   ms: Record<string, number>;
   res: { id: string; ok: boolean } | null;
   fq: FreeQ | null;
+  order: Buzz[];
+  sc: Record<string, number>;
 }
 
 export const initGame = (): Game => ({
@@ -72,7 +78,9 @@ export const initGame = (): Game => ({
   c: null,
   ms: {},
   res: null,
-  fq: null
+  fq: null,
+  order: [],
+  sc: {},
 });
 
 // new question
@@ -86,6 +94,13 @@ export function start(g: Game, now: number) {
   g.c = null;
   g.res = null;
   g.fq = null;
+  g.order = [];
+}
+
+function mark(g: Game, id: string, at: number) {
+  if (g.order.some((b) => b.id === id)) return;
+  const i = g.order.findIndex((b) => b.at > at);
+  if (i < 0) g.order.push({id, at}); else g.order.splice(i, 0, {id, at});
 }
 
 // add buzz sorted by press time; false if rejected
@@ -93,9 +108,10 @@ export function buzz(g: Game, id: string, at: number): boolean {
   if (g.phase !== "open" || g.answerer === id || g.locked.includes(id) || g.queue.some((b) => b.id === id)) return false;
   if (!g.c && (g.answerer || g.queue.length > 0)) return false; // free-form: only one
   const i = g.queue.findIndex((b) => b.at > at);
-  if (i < 0) g.queue.push({ id, at });
-  else g.queue.splice(i, 0, { id, at });
+  if (i < 0) g.queue.push({id, at});
+  else g.queue.splice(i, 0, {id, at});
   g.res = null;
+  mark(g, id, at);
   return true;
 }
 
@@ -108,13 +124,14 @@ export function grant(g: Game) {
 }
 
 // judge current answerer
-export function judge(g: Game, ok: boolean) {
+export function judge(g: Game, ok: boolean, score = 0) {
   const id = g.answerer;
   if (!id) return;
   g.answerer = null;
-  g.res = { id, ok };
+  g.res = {id, ok};
   if (ok) {
     g.pts[id] = (g.pts[id] ?? 0) + 1;
+    g.sc[id] = (g.sc[id] ?? 0) + score;
     g.phase = "idle";
     g.queue = [];
   } else {
@@ -130,6 +147,7 @@ export function end(g: Game) {
   g.c = null;
   g.res = null;
   g.fq = null;
+  g.order = [];
 }
 
 // remove a leaving player
@@ -150,17 +168,22 @@ export function askFree(g: Game, q: FreeQ, now: number) {
 export function ask(g: Game, q: RunQ) {
   end(g);
   g.n++;
-  g.c = { q, phase: "ready", tStream: 0, tAns: 0, deadline: 0, answers: {}, prog: {}, counts: [], results: {} };
+  g.order = [];
+  g.c = {q, phase: "ready", tStream: 0, tAns: 0, deadline: 0, answers: {}, prog: {}, counts: [], results: {}};
   g.res = null;
 }
 
-function award(g: Game, r: ChoiceRun, id: string, ok: boolean, ms: number) {
-  r.results[id] = { ok, ms: ok ? ms : 0 };
+function award(g: Game, r: ChoiceRun, id: string, ok: boolean, ms: number, best: number, gain: number) {
+  r.results[id] = {ok, ms: ok ? ms : 0, sc: ok ? gain : 0};
   if (ok) {
     g.pts[id] = (g.pts[id] ?? 0) + 1;
-    g.ms[id] = (g.ms[id] ?? 0) + ms;
+    g.sc[id] = (g.sc[id] ?? 0) + gain;
+    g.ms[id] = (g.ms[id] ?? 0) + (ms - best);
   }
 }
+
+const fastest = (l: [string, boolean, number][]) => Math.min(...l.filter(([, ok]) => ok).map(([, , ms]) => ms), Infinity);
+
 
 export function cmd(g: Game, c: "show" | "choices" | "close" | "reveal", now: number, correct?: number): boolean {
   const r = g.c;
@@ -195,27 +218,33 @@ export function cmd(g: Game, c: "show" | "choices" | "close" | "reveal", now: nu
     case "reveal":
       if (r.phase !== "closed") return false;
       r.phase = "revealed";
-      if (r.q.type === "choice") {
-        const q = r.q;
-        if (typeof correct === "number" && correct >= 0 && correct < q.choices.length) {
-          q.correct = correct;
-        }
-        for (const [id, a] of Object.entries(r.answers)) award(g, r, id, a.choice === q.correct, a.ms);
-      } else {
-        for (const [id, p] of Object.entries(r.prog)) award(g, r, id, p.state === "done", p.ms);
-      }
+
+      if (r.q.type === "choice" && typeof correct === "number" && correct >= 0 && correct < r.q.choices.length) r.q.correct = correct;
+    {
+      const q = r.q;
+      const l: [string, boolean, number][] =
+        q.type === "choice"
+          ? Object.entries(r.answers).map(([id, a]) => [id, a.choice === q.correct, a.ms])
+          : Object.entries(r.prog).map(([id, p]) => [id, p.state === "done", p.ms]);
+      const best = fastest(l);
+      const oks = l.filter(([, ok]) => ok).sort((a, b) => a[2] - b[2]); // rank by time (ties share rank)
+      const gainOf = (ms: number) => (q.type === "kana" ? scoreAt(q.scores, oks.findIndex((x) => x[2] === ms)) : q.score);
+      for (const [id, ok, ms] of l) award(g, r, id, ok, ms, best, gainOf(ms));
+    }
       return true;
   }
 }
+
 // choice answer; d = client-measured ms since choices shown
 export function answer(g: Game, id: string, choice: number, d: number, now: number): boolean {
   const r = g.c;
   if (!r || r.q.type !== "choice" || r.phase !== "answering" || id in r.answers) return false;
   if (!Number.isInteger(choice) || choice < 0 || choice >= r.q.choices.length) return false;
   if (now > r.deadline + GRACE_MS) return false;
-  r.answers[id] = { choice, ms: pickMs(d, now - r.tAns, r.q.limitMs) };
+  r.answers[id] = {choice, ms: pickMs(d, now - r.tAns, r.q.limitMs)};
   return true;
 }
+
 export const progOf = (g: Game, id: string): KProg | null => g.c?.prog?.[id] ?? null;
 
 // kana: start answering (press); pos = chars the player saw
@@ -229,7 +258,7 @@ export function press(g: Game, id: string, pos: number, now: number): KProg | nu
   const p: KProg = {
     step: 0,
     keys: keysOf(q.steps[0]),
-    ms: 0,
+    ms: now - (r.tStream || r.tAns),
     state: "play",
     pos: Number.isInteger(pos) ? Math.min(Math.max(pos, 0), maxPos) : maxPos,
     t0: now,
@@ -237,6 +266,11 @@ export function press(g: Game, id: string, pos: number, now: number): KProg | nu
     cur: ""
   };
   r.prog[id] = p;
+  mark(g, id, now);
+  if (q.max !== undefined && Object.keys(r.prog).length >= q.max && r.phase === "streaming") {
+    r.phase = "answering";
+    r.stopPos = maxPos; // slots full: stop the stream for everyone
+  }
   return p;
 }
 
@@ -252,7 +286,6 @@ export function key(g: Game, id: string, step: number, k: string, d: number, now
     p.cur += k;
     return p;
   }
-  p.ms += pickMs(d, now - p.t0, step === 0 ? q.firstMs : q.nextMs);
   p.cur += k;
   p.step++;
   p.t0 = now;
@@ -281,15 +314,15 @@ export function key(g: Game, id: string, step: number, k: string, d: number, now
 export function sweep(g: Game, now: number, players: number): { failed: string[] } {
   const r = g.c;
   const failed: string[] = [];
-  if (!r) return { failed };
+  if (!r) return {failed};
   if (r.q.type === "choice") {
     const all = players > 0 && Object.keys(r.answers).length >= players;
     if (r.phase === "answering" && (all || now >= r.deadline + GRACE_MS)) cmd(g, "close", now);
-    return { failed };
+    return {failed};
   }
   const q = r.q;
   if (r.phase === "streaming" && now >= r.tStream + len(q.text) * q.intervalMs) r.phase = "answering";
-  if (r.phase !== "streaming" && r.phase !== "answering") return { failed };
+  if (r.phase !== "streaming" && r.phase !== "answering") return {failed};
   const progs = Object.entries(r.prog);
   for (const [id, p] of progs)
     if (p.state === "play" && now >= p.due + GRACE_MS) {
@@ -300,8 +333,12 @@ export function sweep(g: Game, now: number, players: number): { failed: string[]
   const over = r.phase === "answering" && now >= r.deadline + GRACE_MS;
   const full = q.max !== undefined && progs.length >= q.max;
   const all = players > 0 && progs.length >= players;
-  if (!inPlay && (over || full || all)) r.phase = "closed";
-  return { failed };
+  if (!inPlay && (over || full || all)) {
+    r.phase = "closed";
+    cmd(g, "reveal", now); // everyone finished: show answer now
+  }
+
+  return {failed};
 }
 
 // next time something changes by itself (null = none)

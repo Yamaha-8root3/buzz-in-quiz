@@ -1,11 +1,21 @@
 // src/client/qlist.ts : replace whole file
-import { cleanQ, csvToQs, type Q } from "../shared/quiz";
+import {
+  applySettings,
+  cleanQ,
+  cleanSettings,
+  csvToQs,
+  DEFAULT_SETTINGS,
+  type Q,
+  type RoomSettings
+} from "../shared/quiz";
+
 
 const KEY = "qlist";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 let list: Q[] = [];
 let editing: string | null = null;
-let onAsk: (q: Q) => void = () => {};
+let onAsk: (q: Q) => void = () => {
+};
 
 function load(): Q[] {
   try {
@@ -14,9 +24,11 @@ function load(): Q[] {
     return [];
   }
 }
+
 function save() {
   localStorage.setItem(KEY, JSON.stringify(list));
 }
+
 function mk(t: string, f: () => void) {
   const b = document.createElement("button");
   b.textContent = t;
@@ -30,10 +42,14 @@ function render() {
     ...list.map((q) => {
       const li = document.createElement("li");
       const label = document.createElement("span");
-      label.textContent = { kana: "[半] ", choice: "[選] ", free: "[自] " }[q.type] + (q.text || (q.type === "choice" ? q.choices.join(" / ") : ""));
+      label.textContent = {
+        kana: "[半] ",
+        choice: "[選] ",
+        free: "[自] "
+      }[q.type] + (q.text || (q.type === "choice" ? q.choices.join(" / ") : ""));
       li.append(
         label,
-        mk("出題", () => onAsk(q)),
+        mk("出題", () => onAsk(applySettings(q, readSettings()))),
         mk("編集", () => open(q.id)),
         mk("削除", () => {
           list = list.filter((x) => x.id !== q.id);
@@ -65,12 +81,6 @@ function open(id: string | null) {
   set("qe-ans", q?.ans ?? "");
   document.querySelectorAll<HTMLInputElement>(".qe-c").forEach((el, i) => (el.value = c?.choices[i] ?? ""));
   $<HTMLSelectElement>("qe-correct").value = String(c?.correct ?? 0);
-  set("qe-limit", String((c?.limitMs ?? 10000) / 1000));
-  set("qe-interval", String(k?.intervalMs ?? 150));
-  set("qe-start", String((k?.startMs ?? 5000) / 1000));
-  set("qe-first", String((k?.firstMs ?? 5000) / 1000));
-  set("qe-next", String((k?.nextMs ?? 3000) / 1000));
-  set("qe-max", k?.max === undefined ? "" : String(k.max));
   $<HTMLTextAreaElement>("qe-steps").value = k ? k.steps.map((s) => s.correct + s.dummies.join("")).join("\n") : "";
   $("qe-err").textContent = "";
   syncType();
@@ -78,32 +88,41 @@ function open(id: string | null) {
 }
 
 function commit() {
-  const num = (i: string) => Number($<HTMLInputElement>(i).value);
-  const base = { id: editing ?? crypto.randomUUID(), text: $<HTMLInputElement>("qe-text").value, ans: $<HTMLInputElement>("qe-ans").value };
+  // const num = (i: string) => Number($<HTMLInputElement>(i).value);
+  const d = DEFAULT_SETTINGS;
+  const base = {
+    id: editing ?? crypto.randomUUID(),
+    text: $<HTMLInputElement>("qe-text").value,
+    ans: $<HTMLInputElement>("qe-ans").value
+  };
   const type = $<HTMLSelectElement>("qe-type").value;
   let raw: unknown;
-  if (type === "free") raw = { ...base, type: "free" };
+  if (type === "free") raw = {...base, type: "free"};
   else if (type === "kana") {
     const steps = $<HTMLTextAreaElement>("qe-steps")
       .value.split("\n")
       .map((l) => [...l.replace(/\s/g, "")])
       .filter((a) => a.length)
-      .map((a) => ({ correct: a[0], dummies: a.slice(1) }));
-    const mx = $<HTMLInputElement>("qe-max").value.trim();
+      .map((a) => ({correct: a[0], dummies: a.slice(1)}));
     raw = {
       ...base,
       type: "kana",
-      intervalMs: num("qe-interval"),
-      startMs: num("qe-start") * 1000,
-      firstMs: num("qe-first") * 1000,
-      nextMs: num("qe-next") * 1000,
-      max: mx === "" ? undefined : Number(mx),
+      intervalMs: d.intervalMs,
+      startMs: d.startMs,
+      firstMs: d.firstMs,
+      nextMs: d.nextMs,
       steps
     };
   } else {
     const all = [...document.querySelectorAll<HTMLInputElement>(".qe-c")].map((el) => el.value.trim());
     const k = all.indexOf("");
-    raw = { ...base, type: "choice", choices: k < 0 ? all : all.slice(0, k), correct: Number($<HTMLSelectElement>("qe-correct").value), limitMs: num("qe-limit") * 1000 };
+    raw = {
+      ...base,
+      type: "choice",
+      choices: k < 0 ? all : all.slice(0, k),
+      correct: Number($<HTMLSelectElement>("qe-correct").value),
+      limitMs: d.choiceMs
+    };
   }
   const q = cleanQ(raw);
   if (!q) {
@@ -126,17 +145,50 @@ async function importFile() {
   const buf = await f.arrayBuffer();
   let src: string;
   try {
-    src = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+    src = new TextDecoder("utf-8", {fatal: true}).decode(buf);
   } catch {
     src = new TextDecoder("shift_jis").decode(buf);
   }
-  const { qs, errs } = csvToQs(src);
+  const {qs, errs} = csvToQs(src);
   list.push(...qs);
   save();
   render();
   inp.value = "";
   $("q-import-msg").textContent = `取込 ${qs.length}件` + (errs.length ? ` / エラー ${errs.length}件` : "");
   if (errs.length) alert(errs.slice(0, 10).join("\n"));
+}
+
+const SKEY = "roomSettings";
+const SIDS = ["rs-score-choice", "rs-score-kana", "rs-score-free", "rs-choice", "rs-interval", "rs-start", "rs-first", "rs-next", "rs-max"];
+
+function readSettings(): RoomSettings {
+  const v = (i: string) => $<HTMLInputElement>(i).value.trim();
+  const n = (i: string, k = 1) => (v(i) === "" ? undefined : Number(v(i)) * k);
+  const kana = v("rs-score-kana").split(/[,，]/).map((t) => t.trim()).filter(Boolean).map(Number);
+  return cleanSettings({
+    choiceScore: n("rs-score-choice"),
+    kanaScores: kana.length && kana.every(Number.isFinite) ? kana : undefined,
+    freeScore: n("rs-score-free"),
+    choiceMs: n("rs-choice", 1000),
+    intervalMs: n("rs-interval"),
+    startMs: n("rs-start", 1000),
+    firstMs: n("rs-first", 1000),
+    nextMs: n("rs-next", 1000),
+    max: n("rs-max")
+  })
+    ;
+}
+
+
+export const getSettings = readSettings;
+
+function initSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SKEY) ?? "{}") as Record<string, string>;
+    for (const i of SIDS) if (i in saved) $<HTMLInputElement>(i).value = saved[i];
+  } catch { /* ignore */
+  }
+  for (const i of SIDS) $<HTMLInputElement>(i).onchange = () => localStorage.setItem(SKEY, JSON.stringify(Object.fromEntries(SIDS.map((x) => [x, $<HTMLInputElement>(x).value]))));
 }
 
 export function initQList(ask: (q: Q) => void) {
@@ -149,6 +201,14 @@ export function initQList(ask: (q: Q) => void) {
   $("qe-type").onchange = syncType;
   $("qe-save").onclick = commit;
   $("qe-cancel").onclick = () => $<HTMLDialogElement>("qedit").close();
+}
+
+// ask the top question of the list; false if the list is empty
+export function askFirst(): boolean {
+  const q = list[0];
+  if (!q) return false;
+  onAsk(applySettings(q, readSettings()));
+  return true;
 }
 
 export function removeQ(id: string) {

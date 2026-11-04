@@ -1,7 +1,19 @@
-import { cleanNick, ROOM_ALPHABET, ROOM_ID_RE, type ErrCode, type LogEntry, type Member, type Mode, type ServerMsg, ClientMsg, PublicGame, PublicChoice } from "../shared/types";
-import { type Q } from "../shared/quiz";
-import { connect } from "./net";
-import { initQList, removeQ, addQ } from "./qlist";
+import {
+  cleanNick,
+  ROOM_ALPHABET,
+  ROOM_ID_RE,
+  type ErrCode,
+  type LogEntry,
+  type Member,
+  type Mode,
+  type ServerMsg,
+  ClientMsg,
+  PublicGame,
+  PublicChoice
+} from "../shared/types";
+import {type Q} from "../shared/quiz";
+import {connect} from "./net";
+import {initQList, removeQ, addQ, getSettings, askFirst} from "./qlist";
 
 const ERR: Record<ErrCode, string> = {
   no_room: "ルームが存在しません",
@@ -31,6 +43,7 @@ let lastQn = -1,
   ansQn = -1,
   ansBase = 0; // ansBase: performance.now() when choices were shown
 let kst: Extract<ServerMsg, { type: "kana" }> | null = null;
+let lastAnswerer: string | null = null;
 let ngDelayUntil = 0;
 const askedQs: Q[] = [];
 let kTyped = "";
@@ -44,6 +57,7 @@ const PHASE: Record<string, string> = {
   closed: "締切",
   revealed: "正解発表"
 };
+
 interface View {
   no: string;
   phase: string;
@@ -51,6 +65,7 @@ interface View {
   timer: string;
   foot: string[];
   ratio: number | null;
+  big?: string
 }
 
 function send(m: ClientMsg) {
@@ -92,16 +107,17 @@ const E = {
 
 const q = new URLSearchParams(location.search).get("room");
 if (q) E.room.value = q.toUpperCase();
-E.nick.value = localStorage.getItem("nick") ?? "";
+const idStore: Storage = import.meta.env.DEV ? sessionStorage : localStorage;
+E.nick.value = idStore.getItem("nick") ?? "";
 
 $("join").onclick = () => onSubmit("join");
 $("create").onclick = () => onSubmit("create");
-btn("h-start").onclick = () => send({ type: "start" });
-btn("h-ok").onclick = () => send({ type: "judge", ok: true });
-btn("h-ng").onclick = () => send({ type: "judge", ok: false });
-btn("h-show-q").onclick = () => send({ type: "cmd", cmd: "show" });
-btn("h-show-c").onclick = () => send({ type: "cmd", cmd: "choices" });
-btn("h-reveal").onclick = () => send({ type: "cmd", cmd: "reveal" });
+btn("h-start").onclick = () => send({type: "start"});
+btn("h-ok").onclick = () => send({type: "judge", ok: true, score: Number($<HTMLInputElement>("h-score").value)});
+btn("h-ng").onclick = () => send({type: "judge", ok: false});
+btn("h-show-q").onclick = () => send({type: "cmd", cmd: "show"});
+btn("h-show-c").onclick = () => send({type: "cmd", cmd: "choices"});
+btn("h-reveal").onclick = () => send({type: "cmd", cmd: "reveal"});
 btn("h-next").onclick = () => {
   const g = game;
   if (g?.phase === "open" && !g.c && !g.answerer && ngDelayUntil > performance.now()) {
@@ -110,8 +126,8 @@ btn("h-next").onclick = () => {
   const c = g?.c;
   if (!g) return;
   const canClose = (g.phase === "open" && (!!g.queue.length || !!g.answerer)) || c?.phase === "answering" || c?.phase === "streaming";
-  if (canClose && c) send({ type: "cmd", cmd: "close" });
-  else send({ type: "end" });
+  if (canClose && c) send({type: "cmd", cmd: "close"});
+  else send({type: "end"});
 };
 // btn("h-ox").onclick = () => send({
 //     type: "ask",
@@ -129,10 +145,73 @@ try {
   initQList((q: Q) => {
     askedQs.push(q);
     if (q.id) removeQ(q.id);
-    send({ type: "ask", q });
+    send({type: "ask", q});
   });
 } catch (e) {
   console.error("initQList failed", e);
+}
+
+// ---- auto mode (host): ask from top of list → run → end → wait → next ----
+const REVEAL_DELAY_MS = 1000; // pause between close and reveal
+const autoBox = $<HTMLInputElement>("h-auto");
+const autoWaitEl = $<HTMLInputElement>("h-auto-wait");
+autoWaitEl.value = localStorage.getItem("autoWait") ?? autoWaitEl.value;
+autoWaitEl.onchange = () => localStorage.setItem("autoWait", autoWaitEl.value);
+let autoKey = "";
+let autoTimer: ReturnType<typeof setTimeout> | undefined;
+
+function autoWaitMs() {
+  const s = Number(autoWaitEl.value);
+  return Number.isFinite(s) && s >= 0 ? s * 1000 : 5000;
+}
+
+function setAuto(on: boolean) {
+  autoBox.checked = on;
+  autoKey = "";
+  clearTimeout(autoTimer);
+  if (on) autoStep();
+}
+
+autoBox.onchange = () => setAuto(autoBox.checked);
+
+function autoNext() {
+  if (!askFirst()) setAuto(false); // list exhausted
+}
+
+// advance one step for the current state; each state acts at most once
+function autoStep() {
+  const g = game;
+  if (!autoBox.checked || !g || !me?.host) return;
+  const c = g.c;
+  let key: string;
+  let act: (() => void) | null = null;
+  let delay = 0;
+  if (c) {
+    key = `c${g.n}:${c.phase}`;
+    if (c.phase === "ready") act = () => send({type: "cmd", cmd: "show"});
+    else if (c.phase === "shown") act = () => send({type: "cmd", cmd: "choices"});
+    else if (c.phase === "closed") {
+      act = () => send({type: "cmd", cmd: "reveal"});
+      delay = REVEAL_DELAY_MS;
+    } else if (c.phase === "revealed") {
+      act = autoNext;
+      delay = autoWaitMs();
+    }
+    // streaming / answering: server closes automatically
+  } else if (g.phase === "idle") {
+    key = `f${g.n}:idle`;
+    act = autoNext;
+    delay = g.n ? autoWaitMs() : 0;
+  } else key = `f${g.n}:open`; // free-form: wait for host judge / end
+  if (key === autoKey) return;
+  autoKey = key;
+  clearTimeout(autoTimer);
+  if (act) {
+    const f = act;
+    autoTimer = setTimeout(() => {
+      if (autoBox.checked && autoKey === key) f();
+    }, delay);
+  }
 }
 
 function renderAll() {
@@ -173,6 +252,7 @@ function renderAsked() {
 }
 
 function showTop(msg = "") {
+  setAuto(false);
   joined = false;
   game = null;
   me = null;
@@ -191,10 +271,10 @@ function validate(room: string, nick: string, mode: Mode): string | null {
 
 // persistent device id
 function deviceId(): string {
-  let id = localStorage.getItem("deviceId");
+  let id = idStore.getItem("deviceId");
   if (!id) {
     id = crypto.randomUUID();
-    localStorage.setItem("deviceId", id);
+    idStore.setItem("deviceId", id);
   }
   return id;
 }
@@ -213,10 +293,10 @@ function onSubmit(mode: Mode) {
   if (err) return;
   if (!room) room = genRoomId();
   const nick = cleanNick(raw)!;
-  localStorage.setItem("nick", nick);
+  idStore.setItem("nick", nick);
   const sock = connect(
     room,
-    { type: "hello", mode, id: deviceId(), nick, hostKey: localStorage.getItem(`hostKey:${room}`) ?? undefined },
+    {type: "hello", mode, id: deviceId(), nick, hostKey: idStore.getItem(`hostKey:${room}`) ?? undefined},
     (m) => onServerMsg(room, m),
     (e) => {
       if (ws !== sock) return; // closed on purpose
@@ -263,9 +343,12 @@ function onServerMsg(room: string, m: ServerMsg) {
   switch (m.type) {
     case "welcome":
       console.log("welcome", m.you.host ? "host" : "player");
-      if (m.hostKey) localStorage.setItem(`hostKey:${room}`, m.hostKey);
+      if (m.hostKey) {
+        idStore.setItem(`hostKey:${room}`, m.hostKey);
+
+      }
       joined = true;
-      history.pushState({ view: "room" }, "");
+      history.pushState({view: "room"}, "");
       me = m.you;
       game = m.game;
       offs.length = 0;
@@ -280,18 +363,18 @@ function onServerMsg(room: string, m: ServerMsg) {
       loadLogs(room);
       syncChoice();
       renderAll();
-      addLog({ t: Date.now(), type: "join", nick: m.you.nick });
-      send({ type: "ping", t0: now() });
+      addLog({t: Date.now(), type: "join", nick: m.you.nick});
+      send({type: "ping", t0: now()});
       break;
     case "join":
       roster.set(m.member.id, m.member);
       renderAll();
-      addLog({ t: m.t, type: "join", nick: m.member.nick });
+      addLog({t: m.t, type: "join", nick: m.member.nick});
       break;
     case "leave":
       roster.delete(m.id);
       renderAll();
-      addLog({ t: m.t, type: "leave", nick: m.nick });
+      addLog({t: m.t, type: "leave", nick: m.nick});
       break;
     case "game":
       const oldRes = game?.res;
@@ -305,12 +388,13 @@ function onServerMsg(room: string, m: ServerMsg) {
       }
       syncChoice();
       renderAll();
+      autoStep();
       break;
     case "pong": {
       const t1 = now();
       console.log("rtt", (t1 - m.t0).toFixed(1));
       offs.push(m.ts - (m.t0 + t1) / 2);
-      if (offs.length < 5) send({ type: "ping", t0: now() });
+      if (offs.length < 5) send({type: "ping", t0: now()});
       else {
         offs.sort((a, b) => a - b);
         offset = offs[2];
@@ -338,10 +422,16 @@ function paint(root: HTMLElement, v: View) {
   q(".q-timer").textContent = v.timer;
 
   const txt = q(".q-text");
-  if (v.text.startsWith("<div")) {
-    txt.innerHTML = v.text;
-  } else if (txt.textContent !== v.text) {
+  const key = v.text + "\n" + (v.big ?? "");
+  if (txt.dataset.k !== key) { // rebuild only on change (keeps animation stable)
+    txt.dataset.k = key;
     txt.textContent = v.text;
+    if (v.big !== undefined) {
+      const d = document.createElement("div");
+      d.className = "big-name animate-in";
+      d.textContent = v.big;
+      txt.append(d);
+    }
   }
 
   const qf = q(".q-foot");
@@ -381,10 +471,10 @@ function renderStatus() {
   const g = game;
   if (!g) return;
   const c = g.c;
-  const v: View = { no: g.n ? `Q${g.n}` : "", phase: "", text: "", timer: "", foot: [], ratio: null };
+  const v: View = {no: g.n ? `Q${g.n}` : "", phase: "", text: "", timer: "", foot: [], ratio: null};
   const sec = (ms: number) => (Math.max(0, ms) / 1000).toFixed(1);
   if (c) {
-    const kindName = c.kind === "choice" ? "4択クイズ" : c.kind === "kana" ? "文字入力クイズ" : "早押しクイズ";
+    const kindName = c.kind === "choice" ? "4択" : c.kind === "kana" ? "みんはや式" : "早押し";
     const rules = [];
     // if (c.kind === "kana" && c.max) rules.push(`先着${c.max}名`);
 
@@ -392,7 +482,7 @@ function renderStatus() {
     v.foot.push(kindName);
     if (c.kind === "kana" && c.max) {
       const used = Object.keys(c.ks ?? {}).length;
-      v.foot.push(`回答枠 ${Math.min(used, c.max)}/${c.max}${used >= c.max ? "  満員" : ""}`);
+      v.foot.push(`回答枠 ${Math.min(used, c.max)}/${c.max}${used >= c.max ? "" : ""}`);
     }
 
     v.text = shownText(c) ?? "";
@@ -408,10 +498,14 @@ function renderStatus() {
       v.timer = sec(left);
       v.ratio = left / mine.limitMs;
     } else if (c.kind === "kana" && c.phase === "answering") {
-      v.phase = "回答受付";
-      v.timer = sec(winEnd - performance.now());
+      // entry window timer only while someone can still join
+      const nStarted = Object.keys(c.ks ?? {}).length;
+      const nPlayers = [...roster.values()].filter((m) => !m.host).length;
+      const entryOpen = (c.max === undefined || nStarted < c.max) && nStarted < nPlayers;
+      v.phase = entryOpen ? "回答受付" : "受付終了";
+      if (entryOpen) v.timer = sec(winEnd - performance.now());
     } else v.phase = PHASE[c.phase] ?? "";
-    if (mine) v.foot.push(`入力 ${kTyped || "–"}  (${mine.step}/${mine.total})${mine.state === "done" ? "  完了" : mine.state === "fail" ? "  不正解" : ""}`);
+    if (mine) v.foot.push(`あなたの回答 ${kTyped || "–"}  (${mine.step}/${mine.total}文字)${mine.state === "done" ? "〇" : mine.state === "fail" ? "  ×" : ""}`);
     if (c.phase === "revealed" && me && !me.host) {
       const r = c.results?.[me.id];
       // v.foot.push(r ? (r.ok ? `正解  ${(r.ms / 1000).toFixed(2)}s` : "不正解") : "未回答");
@@ -419,14 +513,18 @@ function renderStatus() {
         .filter((x) => x.ok)
         .map((x) => x.ms);
       const best = oks.length ? Math.min(...oks) : 0;
-      const gap = r?.ok ? (r.ms > best ? `  (+${((r.ms - best) / 1000).toFixed(2)}s)` : "  1位") : "";
-      v.foot.push(r ? (r.ok ? `正解  ${(r.ms / 1000).toFixed(2)}s${gap}` : "不正解") : "未回答");
+      const gap = r?.ok ? (r.ms > best ? `  (1位+${((r.ms - best) / 1000).toFixed(2)}s)` : "  1位") : "";
+      v.foot.push(r ? (r.ok ? `ボタンを押した時間${(r.ms / 1000).toFixed(2)}s${gap}${r.sc ? `  +${r.sc}点` : ""}` : "不正解") : "未回答");
+
     }
-    if (c.answer) v.foot.push(`正解  ${c.answer}`);
+    if (c.answer) v.foot.push(`正解  ${c.answer} ${c.text}`);
   } else {
     const m = g.answerer ? roster.get(g.answerer) : null;
     v.phase = g.n === 0 ? "待機中" : g.phase === "idle" ? "終了" : m ? `回答中` : "出題中";
-    if (m) v.text = `回答中 : <div class="big-name animate-in">${m.nick}</div>`;
+    if (m) {
+      v.text = "回答中 :";
+      v.big = m.nick;
+    }
     if (me?.host && g.fq) {
       if (g.fq.text) v.foot.push(`問題  ${g.fq.text}`);
       if (g.fq.answer) v.foot.push(`答え  ${g.fq.answer}`);
@@ -442,8 +540,7 @@ function renderStatus() {
     }
   }
 
-  if (me?.host) renderProg($("h-prog"), c, true);
-  else renderProg($("p-prog"), c, false);
+  renderProg($("h-prog"), c, !!me?.host);
   // if (me?.host && c && (c.phase === "answering" || c.phase === "streaming" || c.phase === "closed")) {
   //   const players = [...roster.values()].filter((m) => !m.host);
   //   const lines = players
@@ -469,10 +566,11 @@ function renderStatus() {
   const players = [...roster.values()].filter((m) => !m.host).length;
   const started = Object.keys(c?.ks ?? {}).length;
   const extra = c?.kind === "kana" && (c.phase === "streaming" || c.phase === "answering") ? `回答開始 ${started}/${players}  完了 ${c.answered.length}` : c?.phase === "answering" ? `回答 ${c.answered.length}/${players}` : "";
-  paint($("h-question"), { ...v, foot: extra ? [...v.foot, extra] : v.foot });
+  paint($("h-question"), {...v, foot: extra ? [...v.foot, extra] : v.foot});
 }
 
-const STATE_JA: Record<string, string> = { play: "回答中", done: "完了", fail: "不正解" };
+const STATE_JA: Record<string, string> = {play: "回答中", done: "完了", fail: "不正解"};
+
 function renderProg(el: HTMLElement, c: PublicChoice | null, host: boolean) {
   const full = !!c && c.max !== undefined && Object.keys(c.ks ?? {}).length >= c.max;
   const ph = ["streaming", "answering", "closed", "revealed"];
@@ -491,7 +589,7 @@ function renderProg(el: HTMLElement, c: PublicChoice | null, host: boolean) {
     n.textContent = p.nick;
     const t = document.createElement("div");
     t.className = `prog-text ${k.s}`;
-    t.textContent = host ? k.v || "–" : STATE_JA[k.s];
+    t.textContent = k.v !== undefined ? (k.v || "–") : STATE_JA[k.s];
     const v = document.createElement("div");
     v.className = "prog-val";
     v.textContent = `${k.p}/${k.total}`;
@@ -510,36 +608,44 @@ const mk = (cls: string, text = "") => {
 };
 
 function renderMembers() {
-  const g = game,
-    c = g?.c;
+  const g = game, c = g?.c;
   const pts = (id: string) => g?.pts[id] ?? 0;
   const ms = (id: string) => g?.ms[id] ?? 0;
+  const sc = (id: string) => g?.sc?.[id] ?? 0;
   const all = [...roster.values()];
-  const players = all.filter((m) => !m.host).sort((a, b) => pts(b.id) - pts(a.id) || ms(a.id) - ms(b.id));
-  const rows: HTMLElement[] = all
-    .filter((m) => m.host)
-    .map((m) => {
-      const li = document.createElement("li");
-      li.className = "row host";
-      li.textContent = `出題者  ${m.nick}`;
-      return li;
+  const sorted = all.filter((m) => !m.host).sort((a, b) => sc(b.id) - sc(a.id) || pts(b.id) - pts(a.id) || ms(a.id) - ms(b.id));
+  const rankOf = new Map<string, number>();
+  {
+    let r = 0, pk = "";
+    sorted.forEach((m, i) => {
+      const k = `${sc(m.id)}:${pts(m.id)}:${ms(m.id)}`;
+      if (k !== pk) {
+        r = i + 1;
+        pk = k;
+      }
+      rankOf.set(m.id, r);
     });
-  let rank = 0,
-    prev = "";
-  const topMs = players.length ? ms(players[0].id) : 0;
-  players.forEach((m, i) => {
-    const k = `${pts(m.id)}:${ms(m.id)}`;
-    if (k !== prev) {
-      rank = i + 1;
-      prev = k;
-    }
+  }
+  const pinned = (g?.order ?? []).map((id) => sorted.find((m) => m.id === id)).filter((m): m is Member => !!m);
+  const players = [...pinned, ...sorted.filter((m) => !pinned.includes(m))];
+
+  const rows: HTMLElement[] = all.filter((m) => m.host).map((m) => {
+    const li = document.createElement("li");
+    li.className = "row host";
+    li.textContent = `出題者  ${m.nick}`;
+    return li;
+  });
+
+  const topMs = sorted.length ? ms(sorted[0].id) : 0;
+  players.forEach((m) => {
+    const rank = rankOf.get(m.id)!;
     const ks = c?.kind === "kana" ? c.ks?.[m.id] : undefined;
     const st = ks ? ks.s : c?.phase === "answering" && c.answered.includes(m.id) ? "done" : undefined;
     const qi = g?.queue.indexOf(m.id) ?? -1;
     const active = g?.answerer === m.id || st === "play";
-    const dif = i > 0 && topMs && ms(m.id) ? ms(m.id) - topMs : 0;
+    const dif = m !== sorted[0] && ms(m.id) ? ms(m.id) - topMs : 0;
     const gap = dif ? ` (${dif > 0 ? "+" : "-"}${(Math.abs(dif) / 1000).toFixed(2)}s)` : "";
-    const sub = [ms(m.id) ? `${(ms(m.id) / 1000).toFixed(2)}s${gap}` : "", qi >= 0 ? `待機 ${qi + 1}` : ""].filter(Boolean).join("  ");
+    const sub = [pts(m.id) ? `〇 ${pts(m.id)}` : "", ms(m.id) ? `${(ms(m.id) / 1000).toFixed(2)}s` : "", qi >= 0 ? `待機 ${qi + 1}` : ""].filter(Boolean).join("  ");
     const nick = mk("nick", m.nick);
     if (sub) {
       const s = document.createElement("small");
@@ -548,7 +654,7 @@ function renderMembers() {
     }
     const li = document.createElement("li");
     li.className = "row" + (me?.id === m.id ? " me" : "") + (active ? " active" : "");
-    li.append(mk("rank", String(rank)), nick, mk("mark", active ? "▶" : st === "done" ? "✓" : st === "fail" ? "✗" : ""), mk("pts", String(pts(m.id))));
+    li.append(mk("rank", String(rank)), nick, mk("mark", active ? "▶" : st === "done" ? "✓" : st === "fail" ? "✗" : ""), mk("pts", String(sc(m.id))));
     rows.push(li);
   });
   $("members").replaceChildren(...rows);
@@ -627,7 +733,7 @@ function pickKey(k: string, e: Event) {
   if (d > kst.limitMs) return;
   kPending = true;
   kTyped += k;
-  send({ type: "key", step: kst.step, key: k, d });
+  send({type: "key", step: kst.step, key: k, d});
   renderAll();
 }
 
@@ -645,9 +751,11 @@ function updateButtons() {
     btn("h-start").textContent = g.n === 0 ? "自由早押し開始" : "自由形式で次へ";
 
     // 2. 判定
-    btn("h-ok").disabled = !g.answerer;
-    btn("h-ng").disabled = !g.answerer;
-
+    $("h-judge").style.display = g.answerer ? "" : "none"; // ○× + custom score only while someone is answering
+    if (g.answerer !== lastAnswerer) {
+      lastAnswerer = g.answerer;
+      if (g.answerer) $<HTMLInputElement>("h-score").value = String(getSettings().freeScore);
+    }
     // 3. クイズ進行
     btn("h-show-q").disabled = c?.phase !== "ready";
 
@@ -732,14 +840,14 @@ function pick(i: number, e: Event) {
   const c = game?.c;
   if (!c || !me || c.kind !== "choice") return;
   if (me.host) {
-    if (c.phase === "closed") send({ type: "cmd", cmd: "reveal", correct: i });
+    if (c.phase === "closed") send({type: "cmd", cmd: "reveal", correct: i});
     return;
   }
   if (c.phase !== "answering" || myChoice !== null || c.answered.includes(me.id)) return;
   const d = e.timeStamp - ansBase;
   if (d > c.limitMs) return;
   myChoice = i;
-  send({ type: "answer", choice: i, d });
+  send({type: "answer", choice: i, d});
   renderAll();
 }
 
@@ -762,8 +870,8 @@ function onBuzz(e: Event) {
   if (c?.kind === "kana") {
     const n = Array.from(c.text ?? "").length;
     const pos = c.phase === "streaming" ? Math.min(n, Math.max(0, Math.floor((e.timeStamp - streamBase) / (c.intervalMs ?? 100)))) : n;
-    send({ type: "press", pos });
-  } else send({ type: "buzz", at: performance.timeOrigin + e.timeStamp + offset });
+    send({type: "press", pos});
+  } else send({type: "buzz", at: performance.timeOrigin + e.timeStamp + offset});
   btn("buzz").disabled = true;
 }
 
