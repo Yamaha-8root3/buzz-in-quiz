@@ -1,3 +1,4 @@
+export const INTRO_MS = 1500; // question start animation length
 // src/shared/quiz.ts : replace whole file
 export interface KanaStep {
   correct: string;

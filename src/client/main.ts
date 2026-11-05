@@ -1,5 +1,5 @@
 import { cleanNick, ROOM_ALPHABET, ROOM_ID_RE, type ErrCode, type LogEntry, type Member, type Mode, type ServerMsg, ClientMsg, PublicGame, PublicChoice } from "../shared/types";
-import { type Q } from "../shared/quiz";
+import { INTRO_MS, type Q } from "../shared/quiz";
 import { connect } from "./net";
 import { initQList, removeQ, addQ, getSettings, askFirst } from "./qlist";
 
@@ -20,6 +20,9 @@ let logs: LogEntry[] = [];
 const roster = new Map<string, Member>();
 let stepBase = 0,
   winEnd = 0;
+
+let introQn = -1,
+  introEnd = 0;
 
 let game: PublicGame | null = null;
 let me: Member | null = null;
@@ -56,6 +59,7 @@ interface View {
   foot: string[];
   ratio: number | null;
   big?: string;
+  fit?: { key: string; n: number };
 }
 
 function send(m: ClientMsg) {
@@ -116,6 +120,15 @@ btn("h-reset-n").onclick = () => {
 btn("h-reset-all").onclick = () => {
   if (confirm("得点・正解数・時間・問題番号をすべてリセットします")) send({ type: "reset", what: "all" });
 };
+
+function intro(c: PublicChoice): boolean {
+  if (c.kind === "kana") return c.phase === "streaming" && performance.now() < streamBase;
+  if (introQn !== c.qn) {
+    introQn = c.qn;
+    introEnd = performance.now() + INTRO_MS;
+  }
+  return performance.now() < introEnd;
+}
 
 // host: edit one player's score (dialog lives outside the re-rendered list)
 let editId: string | null = null;
@@ -378,10 +391,15 @@ function onServerMsg(room: string, m: ServerMsg) {
         idStore.setItem(`hostKey:${room}`, m.hostKey);
       }
       joined = true;
+      if (!soundAsked) {
+        soundAsked = true;
+        $<HTMLDialogElement>("sound-dialog").showModal();
+      }
       history.pushState({ view: "room" }, "");
       me = m.you;
       game = m.game;
       ovQn = game.c?.phase === "revealed" ? game.c.qn : -1;
+      introQn = game.c?.qn ?? -1;
       offs.length = 0;
       $("top").hidden = true;
       $("room-view").hidden = false;
@@ -409,9 +427,11 @@ function onServerMsg(room: string, m: ServerMsg) {
       break;
     case "game":
       const oldRes = game?.res;
+      const prev = game;
       game = m.g;
+      if (me?.host) hostSounds(prev, game);
       if (game.res && (!oldRes || oldRes.id !== game.res.id || oldRes.ok !== game.res.ok)) {
-        showResultOverlay(game.res.ok);
+        showResultOverlay(game.res.ok, !!me?.host || game.res.id === me?.id); // 本人+出題者だけ鳴らす
         if (!game.res.ok && game.phase === "open" && !game.c) {
           // Free-form NG: set 1sec delay
           ngDelayUntil = performance.now() + 1000;
@@ -429,9 +449,9 @@ function onServerMsg(room: string, m: ServerMsg) {
       break;
     case "pong": {
       const t1 = now();
-      console.log("rtt", (t1 - m.t0).toFixed(1));
+      // console.log("rtt", (t1 - m.t0).toFixed(1));
       offs.push(m.ts - (m.t0 + t1) / 2);
-      if (offs.length < 5) send({ type: "ping", t0: now() });
+      if (offs.length < 5) {send({ type: "ping", t0: now() })}
       else {
         offs.sort((a, b) => a - b);
         offset = offs[2];
@@ -495,9 +515,20 @@ function paint(root: HTMLElement, v: View) {
   const bar = q(".bar");
   bar.hidden = v.ratio === null;
   if (v.ratio !== null) q(".bar i").style.width = `${Math.max(0, Math.min(1, v.ratio)) * 100}%`;
+  if (!v.fit) txt.style.fontSize = "";
+  else {
+    const fk = `${v.fit.key}:${root.clientWidth}x${root.clientHeight}`;
+    if (txt.dataset.fit !== fk) {
+      // once per question / resize
+      txt.dataset.fit = fk;
+      const area = (root.clientWidth - 48) * Math.max(60, root.clientHeight - q(".q-head").offsetHeight - 170) * 0.85;
+      txt.style.fontSize = `${Math.floor(Math.max(16, Math.min(38, Math.sqrt(area / (Math.max(v.fit.n, 1) * 1.75)))))}px`;
+    }
+  }
 }
 
-function showResultOverlay(ok: boolean) {
+function showResultOverlay(ok: boolean, sound = true) {
+  if (sound) (ok ? sfx.ok : sfx.ng)();
   const res = document.createElement("div");
   res.className = `big-result ${ok ? "ok" : "ng"}`;
   res.textContent = ok ? "◎" : "×";
@@ -527,6 +558,12 @@ function renderStatus() {
     }
 
     v.text = shownText(c) ?? "";
+    if (c.text) v.fit = { key: String(c.qn), n: Array.from(c.text).length };
+    if (intro(c)) {
+      v.text = "";
+      v.big = v.no;
+    }
+
     const mine = c.kind === "kana" && me && !me.host && kst?.qn === c.qn ? kst : null;
     if (c.kind === "choice" && c.phase === "answering") {
       const left = c.limitMs - (performance.now() - ansBase);
@@ -578,7 +615,8 @@ function renderStatus() {
     }
   }
 
-  renderProg($("h-prog"), c, !!me?.host);
+  if (me?.host) renderProg($("h-prog"), c, true);
+  else renderProg($("p-prog"), c, false);
   // if (me?.host && c && (c.phase === "answering" || c.phase === "streaming" || c.phase === "closed")) {
   //   const players = [...roster.values()].filter((m) => !m.host);
   //   const lines = players
@@ -614,10 +652,10 @@ function renderProg(el: HTMLElement, c: PublicChoice | null, host: boolean) {
   // server only sends others' entries when this viewer may see them
   const others = c?.kind === "kana" ? Object.keys(c.ks ?? {}).filter((id) => id !== me?.id) : [];
   const side = $("h-prog-side");
+
   if (!c || c.kind !== "kana" || !ph.includes(c.phase) || (!host && !others.length)) {
     el.replaceChildren();
-    el.hidden = true;
-    side.style.visibility = "hidden"; // keep layout, hide the whole panel
+    el.hidden = !host; // host: always visible
     return;
   }
   const rows: HTMLElement[] = [];
@@ -639,7 +677,7 @@ function renderProg(el: HTMLElement, c: PublicChoice | null, host: boolean) {
     rows.push(row);
   }
   el.replaceChildren(...rows);
-  el.hidden = rows.length === 0;
+  el.hidden = !host && rows.length === 0;
   side.style.visibility = rows.length ? "" : "hidden";
 }
 
@@ -914,17 +952,34 @@ function pick(i: number, e: Event) {
   if (c.phase !== "answering" || myChoice !== null || c.answered.includes(me.id)) return;
   const d = e.timeStamp - ansBase;
   if (d > c.limitMs) return;
+  // sfx.press();
   myChoice = i;
   send({ type: "answer", choice: i, d });
   renderAll();
 }
 
-$("choices").addEventListener("pointerdown", (e) => {
+let lastPtr = 0; // click fallback (mouse/keyboard); ignore the click that follows a handled pointerdown
+$("choices").addEventListener(
+  "pointerdown",
+  () => {
+    lastPtr = performance.now();
+  },
+  true
+);
+$("choices").addEventListener("click", (e) => {
+  if (performance.now() - lastPtr < 800) return;
   const el = (e.target as HTMLElement).closest<HTMLElement>(".choice");
-  if (!el) return;
-  if (el.dataset.k !== undefined) pickKey(el.dataset.k, e);
-  else if (el.dataset.i !== undefined) pick(Number(el.dataset.i), e);
+  if (el?.dataset.k !== undefined) pickKey(el.dataset.k, e);
+  else if (el?.dataset.i !== undefined) pick(Number(el.dataset.i), e);
 });
+
+// $("choices").addEventListener("pointerdown", (e) => {
+//   const el = (e.target as HTMLElement).closest<HTMLElement>(".choice");
+//   if (!el) return;
+//   if (el.dataset.k !== undefined) pickKey(el.dataset.k, e);
+//   else if (el.dataset.i !== undefined) pick(Number(el.dataset.i), e);
+// });
+
 $("h-choices").addEventListener("pointerdown", (e) => {
   const el = (e.target as HTMLElement).closest<HTMLElement>(".choice");
   if (!el || el.dataset.i === undefined) return;
@@ -934,6 +989,7 @@ $("h-choices").addEventListener("pointerdown", (e) => {
 // buzz via pointer or Space; time converted to server clock
 function onBuzz(e: Event) {
   if (btn("buzz").disabled) return;
+  sfx.press();
   const c = game?.c;
   if (c?.kind === "kana") {
     const n = Array.from(c.text ?? "").length;
@@ -976,3 +1032,56 @@ $("copy-link").onclick = async () => {
     prompt("招待URL", url);
   }
 };
+
+const SFX_URL = { press: "/sfx/press.mp3", ok: "/sfx/maru.mp3", ng: "/sfx/batu.mp3" };
+type SfxKey = keyof typeof SFX_URL;
+let sfxOn = false;
+const sfxEl: Partial<Record<SfxKey, HTMLAudioElement>> = {};
+function sfxInit() {
+  for (const k of Object.keys(SFX_URL) as SfxKey[]) {
+    const a = new Audio(SFX_URL[k]);
+    a.preload = "auto";
+    a.muted = true;
+    void a
+      .play()
+      .then(() => {
+        a.pause();
+        a.currentTime = 0;
+        a.muted = false;
+      })
+      .catch(() => {
+        a.muted = false;
+      });
+    sfxEl[k] = a;
+  }
+}
+function playSfx(k: SfxKey) {
+  const a = sfxOn ? sfxEl[k] : undefined;
+  if (!a) return;
+  a.currentTime = 0;
+  void a.play().catch(() => {
+    /* blocked / missing file */
+  });
+}
+const sfx = { press: () => playSfx("press"), ok: () => playSfx("ok"), ng: () => playSfx("ng") };
+let soundAsked = false;
+$("sound-on").onclick = () => {
+  sfxOn = true;
+  sfxInit();
+  $<HTMLDialogElement>("sound-dialog").close();
+};
+$("sound-off").onclick = () => {
+  sfxOn = false;
+  $<HTMLDialogElement>("sound-dialog").close();
+};
+
+
+function hostSounds(prev: PublicGame | null, cur: PublicGame) {
+  if (cur.answerer && cur.answerer !== prev?.answerer) sfx.press(); // free-form
+  const pk = prev?.c && prev.c.qn === cur.c?.qn ? prev.c.ks ?? {} : {};
+  for (const [id, k] of Object.entries(cur.c?.ks ?? {})) {
+    const o = pk[id];
+    if (!o) sfx.press();
+    else if (o.s !== k.s) (k.s === "done" ? sfx.ok : sfx.ng)();
+  }
+}

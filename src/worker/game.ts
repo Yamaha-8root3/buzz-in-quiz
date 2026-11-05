@@ -1,4 +1,4 @@
-import { FreeQ, KanaStep, RunQ, scoreAt } from "../shared/quiz";
+import { INTRO_MS, FreeQ, KanaStep, RunQ, scoreAt } from "../shared/quiz";
 
 export const GRACE_MS = 300; // accept after deadline (latency)
 const TOL_MS = 500; // client/server time gap tolerance
@@ -135,7 +135,7 @@ export function judge(g: Game, ok: boolean, score = 0) {
   g.res = { id, ok };
   if (ok) {
     g.pts[id] = (g.pts[id] ?? 0) + 1;
-    g.sc[id] = (g.sc[id] ?? 0) + score;
+    g.sc[id] = Math.max(0, (g.sc[id] ?? 0) + score);
     g.phase = "idle";
     g.queue = [];
   } else {
@@ -171,7 +171,7 @@ export function reset(g: Game, all: boolean, alive: Set<string>) {
 
 // host edit of one player's score / correct count / total ms
 export function setScore(g: Game, id: string, sc: number, pts: number, ms: number) {
-  g.sc[id] = sc;
+  g.sc[id] = Math.max(0, sc);
   g.pts[id] = pts;
   g.ms[id] = ms;
 }
@@ -200,8 +200,10 @@ export function ask(g: Game, q: RunQ) {
 }
 
 function award(g: Game, r: ChoiceRun, id: string, ok: boolean, ms: number, best: number, gain: number) {
-  r.results[id] = { ok, ms: ok ? ms : 0, sc: gain };
-  if (gain) g.sc[id] = Math.min((g.sc[id] ?? 0) + gain, 0);
+  const cur = g.sc[id] ?? 0;
+  const d = Math.max(gain, -cur); // score never goes below 0
+  r.results[id] = { ok, ms: ok ? ms : 0, sc: d };
+  if (d) g.sc[id] = cur + d;
   if (ok) {
     g.pts[id] = (g.pts[id] ?? 0) + 1;
     g.ms[id] = (g.ms[id] ?? 0) + (ms - best);
@@ -218,8 +220,8 @@ export function cmd(g: Game, c: "show" | "choices" | "close" | "reveal", now: nu
       if (r.phase !== "ready") return false;
       if (r.q.type === "kana") {
         r.phase = "streaming";
-        r.tStream = now;
-        r.deadline = now + len(r.q.text) * r.q.intervalMs + r.q.startMs; // press window end
+        r.tStream = now + INTRO_MS;
+        r.deadline = r.tStream + len(r.q.text) * r.q.intervalMs + r.q.startMs; // press window end
       } else r.phase = "shown";
       return true;
     case "choices": // choice: show choices / kana: skip stream
@@ -286,7 +288,9 @@ export const progOf = (g: Game, id: string): KProg | null => g.c?.prog?.[id] ?? 
 // kana: start answering (press); pos = chars the player saw
 export function press(g: Game, id: string, pos: number, now: number): KProg | null {
   const r = g.c;
+
   if (!r || r.q.type !== "kana" || (r.phase !== "streaming" && r.phase !== "answering") || id in r.prog) return null;
+  if (r.phase === "streaming" && now < r.tStream) return null;
   const q = r.q;
   if (now > r.deadline + GRACE_MS) return null;
   if (q.max !== undefined && Object.keys(r.prog).length >= q.max) return null;

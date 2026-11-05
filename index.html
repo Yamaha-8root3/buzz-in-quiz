@@ -78,12 +78,13 @@
         </div>
       </section>
 
-      <aside id="h-prog-side" class="panel">
+      <aside id="h-prog-side" class="panel host-only">
         <h3>回答進捗</h3>
         <div id="h-prog" class="host-progress"></div>
       </aside>
 
       <aside id="side" class="panel">
+        <div id="p-prog" class="host-progress" hidden></div>
         <div class="host-only">
           <details id="rs-details">
             <summary>ルーム設定</summary>
@@ -165,6 +166,13 @@
         </div>
         <p id="qe-err"></p>
         <button id="qe-save">保存</button><button id="qe-cancel">キャンセル</button>
+      </div>
+    </dialog>
+    <dialog id="sound-dialog">
+      <div class="qe">
+        <b>効果音を再生しますか？</b>
+        <button id="sound-on">再生する</button>
+        <button id="sound-off" class="ghost">ミュート</button>
       </div>
     </dialog>
   </body>
