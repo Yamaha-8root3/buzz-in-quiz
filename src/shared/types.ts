@@ -1,4 +1,4 @@
-import type {Q} from "./quiz";
+import type { Q } from "./quiz";
 
 export const ROOM_ID_RE = /^[A-Z0-9]{4,8}$/;
 export const ROOM_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -9,13 +9,13 @@ export type Mode = "create" | "join";
 export interface Member {
   id: string;
   nick: string;
-  host: boolean
+  host: boolean;
 }
 
 export interface LogEntry {
   t: number;
   type: "join" | "leave";
-  nick: string
+  nick: string;
 }
 
 export type ErrCode = "no_room" | "exists" | "bad_nick" | "dup_nick" | "bad_msg";
@@ -33,7 +33,8 @@ export interface PublicGame {
   fq: { text?: string; answer?: string } | null; // free question (host only)
   order: string[]; // press order (scoreboard pin)
   pts: Record<string, number>; // correct count (tiebreak)
-  sc: Record<string, number>;  // score
+  sc: Record<string, number>; // score
+  names: Record<string, string>;
 }
 
 export type ClientMsg =
@@ -48,6 +49,9 @@ export type ClientMsg =
   | { type: "answer"; choice: number; d: number }
   | { type: "key"; step: number; key: string; d: number }
   | { type: "press"; pos: number }
+  | { type: "reset"; what: "n" | "all" }
+  | { type: "setScore"; id: string; sc: number; pts: number; ms: number }
+  | { type: "revive" };
 export type HelloMsg = Extract<ClientMsg, { type: "hello" }>;
 export type ServerMsg =
   | { type: "welcome"; you: Member; members: Member[]; game: PublicGame; hostKey?: string }
@@ -56,7 +60,7 @@ export type ServerMsg =
   | { type: "game"; g: PublicGame }
   | { type: "pong"; t0: number; ts: number }
   | { type: "error"; code: ErrCode }
-  | { type: "kana"; qn: number; step: number; total: number; keys: string[]; state: "play" | "done" | "fail"; pos: number; limitMs: number; leftMs: number }
+  | { type: "kana"; qn: number; step: number; total: number; keys: string[]; state: "play" | "done" | "fail"; pos: number; limitMs: number; leftMs: number };
 
 // normalize/validate nickname (full-width OK; length by code points)
 export function cleanNick(s: unknown): string | null {
@@ -68,13 +72,25 @@ export function cleanNick(s: unknown): string | null {
 }
 
 export interface PublicChoice {
-  qn: number; kind: "choice" | "kana";
+  qn: number;
+  kind: "choice" | "kana";
   phase: "ready" | "shown" | "streaming" | "answering" | "closed" | "revealed";
-  text?: string; choices?: string[];
-  intervalMs?: number; sMs?: number; total?: number; // kana
-  limitMs: number; leftMs: number;
+  text?: string;
+  choices?: string[];
+  intervalMs?: number;
+  sMs?: number;
+  total?: number; // kana
+  limitMs: number;
+  leftMs: number;
   answered: string[];
-  counts?: number[]; correct?: number; answer?: string;
+  counts?: number[];
+  correct?: number;
+  answer?: string;
   results?: Record<string, { ok: boolean; ms: number; sc?: number }>;
-  startLeftMs?: number; max?: number; ks?: Record<string, { s: "play" | "done" | "fail"; p: number; total: number; v?: string }>;
+  startLeftMs?: number;
+  max?: number;
+  full?: boolean;
+  entryOpen?: boolean;
+  started?: number; // kana: full = slots filled, entryOpen = someone can still press, started = host only
+  ks?: Record<string, { s: "play" | "done" | "fail"; p: number; total: number; v?: string }>;
 }

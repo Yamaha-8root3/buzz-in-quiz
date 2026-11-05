@@ -1,21 +1,11 @@
 // src/client/qlist.ts : replace whole file
-import {
-  applySettings,
-  cleanQ,
-  cleanSettings,
-  csvToQs,
-  DEFAULT_SETTINGS,
-  type Q,
-  type RoomSettings
-} from "../shared/quiz";
-
+import { applySettings, cleanQ, cleanSettings, csvToQs, DEFAULT_SETTINGS, type Q, type RoomSettings } from "../shared/quiz";
 
 const KEY = "qlist";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 let list: Q[] = [];
 let editing: string | null = null;
-let onAsk: (q: Q) => void = () => {
-};
+let onAsk: (q: Q) => void = () => {};
 
 function load(): Q[] {
   try {
@@ -42,11 +32,12 @@ function render() {
     ...list.map((q) => {
       const li = document.createElement("li");
       const label = document.createElement("span");
-      label.textContent = {
-        kana: "[半] ",
-        choice: "[選] ",
-        free: "[自] "
-      }[q.type] + (q.text || (q.type === "choice" ? q.choices.join(" / ") : ""));
+      label.textContent =
+        {
+          kana: "[半] ",
+          choice: "[選] ",
+          free: "[自] "
+        }[q.type] + (q.text || (q.type === "choice" ? q.choices.join(" / ") : ""));
       li.append(
         label,
         mk("出題", () => onAsk(applySettings(q, readSettings()))),
@@ -97,13 +88,13 @@ function commit() {
   };
   const type = $<HTMLSelectElement>("qe-type").value;
   let raw: unknown;
-  if (type === "free") raw = {...base, type: "free"};
+  if (type === "free") raw = { ...base, type: "free" };
   else if (type === "kana") {
     const steps = $<HTMLTextAreaElement>("qe-steps")
       .value.split("\n")
       .map((l) => [...l.replace(/\s/g, "")])
       .filter((a) => a.length)
-      .map((a) => ({correct: a[0], dummies: a.slice(1)}));
+      .map((a) => ({ correct: a[0], dummies: a.slice(1) }));
     raw = {
       ...base,
       type: "kana",
@@ -145,11 +136,11 @@ async function importFile() {
   const buf = await f.arrayBuffer();
   let src: string;
   try {
-    src = new TextDecoder("utf-8", {fatal: true}).decode(buf);
+    src = new TextDecoder("utf-8", { fatal: true }).decode(buf);
   } catch {
     src = new TextDecoder("shift_jis").decode(buf);
   }
-  const {qs, errs} = csvToQs(src);
+  const { qs, errs } = csvToQs(src);
   list.push(...qs);
   save();
   render();
@@ -159,13 +150,18 @@ async function importFile() {
 }
 
 const SKEY = "roomSettings";
-const SIDS = ["rs-score-choice", "rs-score-kana", "rs-score-free", "rs-choice", "rs-interval", "rs-start", "rs-first", "rs-next", "rs-max"];
+const SIDS = ["rs-penalty-kana", "rs-score-choice", "rs-score-choice", "rs-score-kana", "rs-score-free", "rs-choice", "rs-interval", "rs-start", "rs-first", "rs-next", "rs-max"];
 
 function readSettings(): RoomSettings {
   const v = (i: string) => $<HTMLInputElement>(i).value.trim();
   const n = (i: string, k = 1) => (v(i) === "" ? undefined : Number(v(i)) * k);
-  const kana = v("rs-score-kana").split(/[,，]/).map((t) => t.trim()).filter(Boolean).map(Number);
+  const kana = v("rs-score-kana")
+    .split(/[,，]/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map(Number);
   return cleanSettings({
+    kanaPenalty: n("rs-penalty-kana"),
     choiceScore: n("rs-score-choice"),
     kanaScores: kana.length && kana.every(Number.isFinite) ? kana : undefined,
     freeScore: n("rs-score-free"),
@@ -175,10 +171,8 @@ function readSettings(): RoomSettings {
     firstMs: n("rs-first", 1000),
     nextMs: n("rs-next", 1000),
     max: n("rs-max")
-  })
-    ;
+  });
 }
-
 
 export const getSettings = readSettings;
 
@@ -186,7 +180,8 @@ function initSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem(SKEY) ?? "{}") as Record<string, string>;
     for (const i of SIDS) if (i in saved) $<HTMLInputElement>(i).value = saved[i];
-  } catch { /* ignore */
+  } catch {
+    /* ignore */
   }
   for (const i of SIDS) $<HTMLInputElement>(i).onchange = () => localStorage.setItem(SKEY, JSON.stringify(Object.fromEntries(SIDS.map((x) => [x, $<HTMLInputElement>(x).value]))));
 }

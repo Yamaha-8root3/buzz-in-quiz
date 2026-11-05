@@ -1,19 +1,7 @@
-import {
-  cleanNick,
-  ROOM_ALPHABET,
-  ROOM_ID_RE,
-  type ErrCode,
-  type LogEntry,
-  type Member,
-  type Mode,
-  type ServerMsg,
-  ClientMsg,
-  PublicGame,
-  PublicChoice
-} from "../shared/types";
-import {type Q} from "../shared/quiz";
-import {connect} from "./net";
-import {initQList, removeQ, addQ, getSettings, askFirst} from "./qlist";
+import { cleanNick, ROOM_ALPHABET, ROOM_ID_RE, type ErrCode, type LogEntry, type Member, type Mode, type ServerMsg, ClientMsg, PublicGame, PublicChoice } from "../shared/types";
+import { type Q } from "../shared/quiz";
+import { connect } from "./net";
+import { initQList, removeQ, addQ, getSettings, askFirst } from "./qlist";
 
 const ERR: Record<ErrCode, string> = {
   no_room: "ルームが存在しません",
@@ -42,6 +30,8 @@ let myChoice: number | null = null;
 let lastQn = -1,
   ansQn = -1,
   ansBase = 0; // ansBase: performance.now() when choices were shown
+let ovQn = -1; // question number whose ◎/× overlay was already shown（lastAnswerer の近く）
+
 let kst: Extract<ServerMsg, { type: "kana" }> | null = null;
 let lastAnswerer: string | null = null;
 let ngDelayUntil = 0;
@@ -65,7 +55,7 @@ interface View {
   timer: string;
   foot: string[];
   ratio: number | null;
-  big?: string
+  big?: string;
 }
 
 function send(m: ClientMsg) {
@@ -95,6 +85,7 @@ const E = {
   qAsked: $("q-asked"),
   copyLink: $("copy-link"),
   hStart: btn("h-start"),
+
   hOk: btn("h-ok"),
   hNg: btn("h-ng"),
   hShowQ: btn("h-show-q"),
@@ -112,12 +103,52 @@ E.nick.value = idStore.getItem("nick") ?? "";
 
 $("join").onclick = () => onSubmit("join");
 $("create").onclick = () => onSubmit("create");
-btn("h-start").onclick = () => send({type: "start"});
-btn("h-ok").onclick = () => send({type: "judge", ok: true, score: Number($<HTMLInputElement>("h-score").value)});
-btn("h-ng").onclick = () => send({type: "judge", ok: false});
-btn("h-show-q").onclick = () => send({type: "cmd", cmd: "show"});
-btn("h-show-c").onclick = () => send({type: "cmd", cmd: "choices"});
-btn("h-reveal").onclick = () => send({type: "cmd", cmd: "reveal"});
+btn("h-start").onclick = () => send({ type: "start" });
+btn("h-revive").onclick = () => send({ type: "revive" }); // h-start の onclick の次
+btn("h-ok").onclick = () => send({ type: "judge", ok: true, score: Number($<HTMLInputElement>("h-score").value) });
+btn("h-ng").onclick = () => send({ type: "judge", ok: false });
+btn("h-show-q").onclick = () => send({ type: "cmd", cmd: "show" });
+btn("h-show-c").onclick = () => send({ type: "cmd", cmd: "choices" });
+btn("h-reveal").onclick = () => send({ type: "cmd", cmd: "reveal" });
+btn("h-reset-n").onclick = () => {
+  if (confirm("問題番号を0に戻します（出題中の問題も終了します）")) send({ type: "reset", what: "n" });
+};
+btn("h-reset-all").onclick = () => {
+  if (confirm("得点・正解数・時間・問題番号をすべてリセットします")) send({ type: "reset", what: "all" });
+};
+
+// host: edit one player's score (dialog lives outside the re-rendered list)
+let editId: string | null = null;
+function openScoreEdit(id: string) {
+  const g = game,
+    nick = roster.get(id)?.nick ?? g?.names?.[id];
+  if (!g || !nick) return;
+  const m = roster.get(id);
+  // if (!g || !m) return;
+  editId = id;
+  $("sc-name").textContent = nick;
+  $<HTMLInputElement>("sc-score").value = String(g.sc?.[id] ?? 0);
+  $<HTMLInputElement>("sc-pts").value = String(g.pts[id] ?? 0);
+  $<HTMLInputElement>("sc-ms").value = ((g.ms[id] ?? 0) / 1000).toFixed(2);
+  $<HTMLDialogElement>("sc-dialog").showModal();
+}
+$("sc-save").onclick = () => {
+  if (editId)
+    send({
+      type: "setScore",
+      id: editId,
+      sc: Number($<HTMLInputElement>("sc-score").value),
+      pts: Number($<HTMLInputElement>("sc-pts").value),
+      ms: Math.round(Number($<HTMLInputElement>("sc-ms").value) * 1000)
+    });
+  $<HTMLDialogElement>("sc-dialog").close();
+};
+$("sc-cancel").onclick = () => $<HTMLDialogElement>("sc-dialog").close();
+$("members").addEventListener("pointerdown", (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>(".edit");
+  if (b?.dataset.id) openScoreEdit(b.dataset.id);
+});
+
 btn("h-next").onclick = () => {
   const g = game;
   if (g?.phase === "open" && !g.c && !g.answerer && ngDelayUntil > performance.now()) {
@@ -126,8 +157,8 @@ btn("h-next").onclick = () => {
   const c = g?.c;
   if (!g) return;
   const canClose = (g.phase === "open" && (!!g.queue.length || !!g.answerer)) || c?.phase === "answering" || c?.phase === "streaming";
-  if (canClose && c) send({type: "cmd", cmd: "close"});
-  else send({type: "end"});
+  if (canClose && c) send({ type: "cmd", cmd: "close" });
+  else send({ type: "end" });
 };
 // btn("h-ox").onclick = () => send({
 //     type: "ask",
@@ -145,7 +176,7 @@ try {
   initQList((q: Q) => {
     askedQs.push(q);
     if (q.id) removeQ(q.id);
-    send({type: "ask", q});
+    send({ type: "ask", q });
   });
 } catch (e) {
   console.error("initQList failed", e);
@@ -188,10 +219,10 @@ function autoStep() {
   let delay = 0;
   if (c) {
     key = `c${g.n}:${c.phase}`;
-    if (c.phase === "ready") act = () => send({type: "cmd", cmd: "show"});
-    else if (c.phase === "shown") act = () => send({type: "cmd", cmd: "choices"});
+    if (c.phase === "ready") act = () => send({ type: "cmd", cmd: "show" });
+    else if (c.phase === "shown") act = () => send({ type: "cmd", cmd: "choices" });
     else if (c.phase === "closed") {
-      act = () => send({type: "cmd", cmd: "reveal"});
+      act = () => send({ type: "cmd", cmd: "reveal" });
       delay = REVEAL_DELAY_MS;
     } else if (c.phase === "revealed") {
       act = autoNext;
@@ -296,7 +327,7 @@ function onSubmit(mode: Mode) {
   idStore.setItem("nick", nick);
   const sock = connect(
     room,
-    {type: "hello", mode, id: deviceId(), nick, hostKey: idStore.getItem(`hostKey:${room}`) ?? undefined},
+    { type: "hello", mode, id: deviceId(), nick, hostKey: idStore.getItem(`hostKey:${room}`) ?? undefined },
     (m) => onServerMsg(room, m),
     (e) => {
       if (ws !== sock) return; // closed on purpose
@@ -345,12 +376,12 @@ function onServerMsg(room: string, m: ServerMsg) {
       console.log("welcome", m.you.host ? "host" : "player");
       if (m.hostKey) {
         idStore.setItem(`hostKey:${room}`, m.hostKey);
-
       }
       joined = true;
-      history.pushState({view: "room"}, "");
+      history.pushState({ view: "room" }, "");
       me = m.you;
       game = m.game;
+      ovQn = game.c?.phase === "revealed" ? game.c.qn : -1;
       offs.length = 0;
       $("top").hidden = true;
       $("room-view").hidden = false;
@@ -363,18 +394,18 @@ function onServerMsg(room: string, m: ServerMsg) {
       loadLogs(room);
       syncChoice();
       renderAll();
-      addLog({t: Date.now(), type: "join", nick: m.you.nick});
-      send({type: "ping", t0: now()});
+      addLog({ t: Date.now(), type: "join", nick: m.you.nick });
+      send({ type: "ping", t0: now() });
       break;
     case "join":
       roster.set(m.member.id, m.member);
       renderAll();
-      addLog({t: m.t, type: "join", nick: m.member.nick});
+      addLog({ t: m.t, type: "join", nick: m.member.nick });
       break;
     case "leave":
       roster.delete(m.id);
       renderAll();
-      addLog({t: m.t, type: "leave", nick: m.nick});
+      addLog({ t: m.t, type: "leave", nick: m.nick });
       break;
     case "game":
       const oldRes = game?.res;
@@ -386,6 +417,12 @@ function onServerMsg(room: string, m: ServerMsg) {
           ngDelayUntil = performance.now() + 1000;
         }
       }
+      if (game.c?.phase === "revealed" && me && !me.host && ovQn !== game.c.qn) {
+        ovQn = game.c.qn;
+        const r = game.c.results?.[me.id];
+        if (r) showResultOverlay(r.ok); // choice / kana result
+      }
+
       syncChoice();
       renderAll();
       autoStep();
@@ -394,7 +431,7 @@ function onServerMsg(room: string, m: ServerMsg) {
       const t1 = now();
       console.log("rtt", (t1 - m.t0).toFixed(1));
       offs.push(m.ts - (m.t0 + t1) / 2);
-      if (offs.length < 5) send({type: "ping", t0: now()});
+      if (offs.length < 5) send({ type: "ping", t0: now() });
       else {
         offs.sort((a, b) => a - b);
         offset = offs[2];
@@ -405,6 +442,10 @@ function onServerMsg(room: string, m: ServerMsg) {
     case "kana":
       if (m.qn !== game?.c?.qn) break;
       kst = m;
+      if (m.state === "fail" && ovQn !== m.qn) {
+        ovQn = m.qn;
+        showResultOverlay(false); // wrong key / timeout: show right away
+      }
       kPending = false;
       stepBase = performance.now() - (m.limitMs - m.leftMs);
       renderAll();
@@ -423,7 +464,8 @@ function paint(root: HTMLElement, v: View) {
 
   const txt = q(".q-text");
   const key = v.text + "\n" + (v.big ?? "");
-  if (txt.dataset.k !== key) { // rebuild only on change (keeps animation stable)
+  if (txt.dataset.k !== key) {
+    // rebuild only on change (keeps animation stable)
     txt.dataset.k = key;
     txt.textContent = v.text;
     if (v.big !== undefined) {
@@ -459,7 +501,7 @@ function showResultOverlay(ok: boolean) {
   const res = document.createElement("div");
   res.className = `big-result ${ok ? "ok" : "ng"}`;
   res.textContent = ok ? "◎" : "×";
-  document.body.append(res);
+  ($(me?.host ? "h-question" : "question") ?? document.body).append(res); // centered in the question stage
   setTimeout(() => {
     res.style.opacity = "0";
     res.style.transition = "opacity 0.3s";
@@ -471,7 +513,7 @@ function renderStatus() {
   const g = game;
   if (!g) return;
   const c = g.c;
-  const v: View = {no: g.n ? `Q${g.n}` : "", phase: "", text: "", timer: "", foot: [], ratio: null};
+  const v: View = { no: g.n ? `Q${g.n}` : "", phase: "", text: "", timer: "", foot: [], ratio: null };
   const sec = (ms: number) => (Math.max(0, ms) / 1000).toFixed(1);
   if (c) {
     const kindName = c.kind === "choice" ? "4択" : c.kind === "kana" ? "みんはや式" : "早押し";
@@ -481,8 +523,7 @@ function renderStatus() {
     // v.foot.push(`${kindName}${rules.length ? ` (${rules.join(", ")})` : ""}`);
     v.foot.push(kindName);
     if (c.kind === "kana" && c.max) {
-      const used = Object.keys(c.ks ?? {}).length;
-      v.foot.push(`回答枠 ${Math.min(used, c.max)}/${c.max}${used >= c.max ? "" : ""}`);
+      v.foot.push(me?.host ? `回答枠 ${c.started ?? 0}/${c.max}${c.full ? "  満員" : ""}` : `先着${c.max}名${c.full ? "  満員" : ""}`);
     }
 
     v.text = shownText(c) ?? "";
@@ -499,9 +540,7 @@ function renderStatus() {
       v.ratio = left / mine.limitMs;
     } else if (c.kind === "kana" && c.phase === "answering") {
       // entry window timer only while someone can still join
-      const nStarted = Object.keys(c.ks ?? {}).length;
-      const nPlayers = [...roster.values()].filter((m) => !m.host).length;
-      const entryOpen = (c.max === undefined || nStarted < c.max) && nStarted < nPlayers;
+      const entryOpen = c.entryOpen !== false;
       v.phase = entryOpen ? "回答受付" : "受付終了";
       if (entryOpen) v.timer = sec(winEnd - performance.now());
     } else v.phase = PHASE[c.phase] ?? "";
@@ -514,8 +553,7 @@ function renderStatus() {
         .map((x) => x.ms);
       const best = oks.length ? Math.min(...oks) : 0;
       const gap = r?.ok ? (r.ms > best ? `  (1位+${((r.ms - best) / 1000).toFixed(2)}s)` : "  1位") : "";
-      v.foot.push(r ? (r.ok ? `ボタンを押した時間${(r.ms / 1000).toFixed(2)}s${gap}${r.sc ? `  +${r.sc}点` : ""}` : "不正解") : "未回答");
-
+      v.foot.push(r ? (r.ok ? `ボタンを押した時間${(r.ms / 1000).toFixed(2)}s${gap}${r.sc ? `  +${r.sc}点` : ""}` : `不正解${r.sc ? `  ${r.sc}点` : ""}`) : "未回答");
     }
     if (c.answer) v.foot.push(`正解  ${c.answer} ${c.text}`);
   } else {
@@ -566,22 +604,26 @@ function renderStatus() {
   const players = [...roster.values()].filter((m) => !m.host).length;
   const started = Object.keys(c?.ks ?? {}).length;
   const extra = c?.kind === "kana" && (c.phase === "streaming" || c.phase === "answering") ? `回答開始 ${started}/${players}  完了 ${c.answered.length}` : c?.phase === "answering" ? `回答 ${c.answered.length}/${players}` : "";
-  paint($("h-question"), {...v, foot: extra ? [...v.foot, extra] : v.foot});
+  paint($("h-question"), { ...v, foot: extra ? [...v.foot, extra] : v.foot });
 }
 
-const STATE_JA: Record<string, string> = {play: "回答中", done: "完了", fail: "不正解"};
+const STATE_JA: Record<string, string> = { play: "回答中", done: "完了", fail: "不正解" };
 
 function renderProg(el: HTMLElement, c: PublicChoice | null, host: boolean) {
-  const full = !!c && c.max !== undefined && Object.keys(c.ks ?? {}).length >= c.max;
   const ph = ["streaming", "answering", "closed", "revealed"];
-  if (!c || c.kind !== "kana" || !ph.includes(c.phase) || !(host || full)) {
+  // server only sends others' entries when this viewer may see them
+  const others = c?.kind === "kana" ? Object.keys(c.ks ?? {}).filter((id) => id !== me?.id) : [];
+  const side = $("h-prog-side");
+  if (!c || c.kind !== "kana" || !ph.includes(c.phase) || (!host && !others.length)) {
+    el.replaceChildren();
     el.hidden = true;
+    side.style.visibility = "hidden"; // keep layout, hide the whole panel
     return;
   }
   const rows: HTMLElement[] = [];
   for (const p of roster.values()) {
     const k = c.ks?.[p.id];
-    if (p.host || !k) continue;
+    if (p.host || !k || (!host && p.id === me?.id)) continue;
     const row = document.createElement("div");
     row.className = "prog-row";
     const n = document.createElement("div");
@@ -589,7 +631,7 @@ function renderProg(el: HTMLElement, c: PublicChoice | null, host: boolean) {
     n.textContent = p.nick;
     const t = document.createElement("div");
     t.className = `prog-text ${k.s}`;
-    t.textContent = k.v !== undefined ? (k.v || "–") : STATE_JA[k.s];
+    t.textContent = k.v !== undefined ? k.v || "–" : STATE_JA[k.s];
     const v = document.createElement("div");
     v.className = "prog-val";
     v.textContent = `${k.p}/${k.total}`;
@@ -598,6 +640,7 @@ function renderProg(el: HTMLElement, c: PublicChoice | null, host: boolean) {
   }
   el.replaceChildren(...rows);
   el.hidden = rows.length === 0;
+  side.style.visibility = rows.length ? "" : "hidden";
 }
 
 const mk = (cls: string, text = "") => {
@@ -608,15 +651,20 @@ const mk = (cls: string, text = "") => {
 };
 
 function renderMembers() {
-  const g = game, c = g?.c;
+  const g = game,
+    c = g?.c;
   const pts = (id: string) => g?.pts[id] ?? 0;
   const ms = (id: string) => g?.ms[id] ?? 0;
   const sc = (id: string) => g?.sc?.[id] ?? 0;
   const all = [...roster.values()];
-  const sorted = all.filter((m) => !m.host).sort((a, b) => sc(b.id) - sc(a.id) || pts(b.id) - pts(a.id) || ms(a.id) - ms(b.id));
+  const absent: Member[] = Object.entries(g?.names ?? {})
+    .filter(([id]) => !roster.has(id) && (id in (g?.pts ?? {}) || id in (g?.sc ?? {}) || id in (g?.ms ?? {})))
+    .map(([id, nick]) => ({ id, nick, host: false }));
+  const sorted = [...all.filter((m) => !m.host), ...absent].sort((a, b) => sc(b.id) - sc(a.id) || pts(b.id) - pts(a.id) || ms(a.id) - ms(b.id));
   const rankOf = new Map<string, number>();
   {
-    let r = 0, pk = "";
+    let r = 0,
+      pk = "";
     sorted.forEach((m, i) => {
       const k = `${sc(m.id)}:${pts(m.id)}:${ms(m.id)}`;
       if (k !== pk) {
@@ -629,12 +677,14 @@ function renderMembers() {
   const pinned = (g?.order ?? []).map((id) => sorted.find((m) => m.id === id)).filter((m): m is Member => !!m);
   const players = [...pinned, ...sorted.filter((m) => !pinned.includes(m))];
 
-  const rows: HTMLElement[] = all.filter((m) => m.host).map((m) => {
-    const li = document.createElement("li");
-    li.className = "row host";
-    li.textContent = `出題者  ${m.nick}`;
-    return li;
-  });
+  const rows: HTMLElement[] = all
+    .filter((m) => m.host)
+    .map((m) => {
+      const li = document.createElement("li");
+      li.className = "row host";
+      li.textContent = `出題者  ${m.nick}`;
+      return li;
+    });
 
   const topMs = sorted.length ? ms(sorted[0].id) : 0;
   players.forEach((m) => {
@@ -645,7 +695,7 @@ function renderMembers() {
     const active = g?.answerer === m.id || st === "play";
     const dif = m !== sorted[0] && ms(m.id) ? ms(m.id) - topMs : 0;
     const gap = dif ? ` (${dif > 0 ? "+" : "-"}${(Math.abs(dif) / 1000).toFixed(2)}s)` : "";
-    const sub = [pts(m.id) ? `〇 ${pts(m.id)}` : "", ms(m.id) ? `${(ms(m.id) / 1000).toFixed(2)}s` : "", qi >= 0 ? `待機 ${qi + 1}` : ""].filter(Boolean).join("  ");
+    const sub = [pts(m.id) ? `〇 ${pts(m.id)}` : "", ms(m.id) ? `${(ms(m.id) / 1000).toFixed(2)}s` : "", qi >= 0 ? `待機 ${qi + 1}` : "", , roster.has(m.id) ? "" : "退出"].filter(Boolean).join("  ");
     const nick = mk("nick", m.nick);
     if (sub) {
       const s = document.createElement("small");
@@ -653,8 +703,18 @@ function renderMembers() {
       nick.append(s);
     }
     const li = document.createElement("li");
-    li.className = "row" + (me?.id === m.id ? " me" : "") + (active ? " active" : "");
+    li.className = "row" + (me?.id === m.id ? " me" : "") + (active ? " active" : "") + (roster.has(m.id) ? "" : " absent");
     li.append(mk("rank", String(rank)), nick, mk("mark", active ? "▶" : st === "done" ? "✓" : st === "fail" ? "✗" : ""), mk("pts", String(sc(m.id))));
+    if (me?.host) {
+      const b = document.createElement("button");
+      b.className = "edit ghost";
+      b.dataset.id = m.id;
+      b.textContent = "✎";
+      b.title = "スコア編集";
+      li.classList.add("editable");
+      li.append(b);
+    }
+
     rows.push(li);
   });
   $("members").replaceChildren(...rows);
@@ -714,12 +774,15 @@ function renderKeys(el: HTMLElement) {
     el.replaceChildren();
     return;
   }
+  const keys = kst!.keys;
+  const cur = Array.from(el.children) as HTMLElement[];
+  if (cur.length === keys.length && cur.every((b, i) => b.dataset.k === keys[i])) return; // unchanged: keep DOM (no hover flicker)
   el.replaceChildren(
-    ...kst!.keys.map((k, i) => {
+    ...keys.map((k, i) => {
       const b = document.createElement("button");
       b.className = "choice key";
-      b.dataset.k = k;
-      b.textContent = `${i + 1}. ${k}`;
+      b.textContent = k;
+      b.dataset.n = String(i + 1);
       return b;
     })
   );
@@ -732,8 +795,11 @@ function pickKey(k: string, e: Event) {
   const d = e.timeStamp - stepBase;
   if (d > kst.limitMs) return;
   kPending = true;
+  setTimeout(() => {
+    kPending = false;
+  }, 1000); // safety: unlock if the server never replies (rejected key)
   kTyped += k;
-  send({type: "key", step: kst.step, key: k, d});
+  send({ type: "key", step: kst.step, key: k, d });
   renderAll();
 }
 
@@ -748,6 +814,7 @@ function updateButtons() {
     const isFree = g.phase === "open" && !c;
     btn("h-start").disabled = !!c || isFree;
     // btn("h-ox").disabled = !!c || isFree;
+    btn("h-revive").disabled = !(g.phase === "open" && !c && g.locked.length > 0);
     btn("h-start").textContent = g.n === 0 ? "自由早押し開始" : "自由形式で次へ";
 
     // 2. 判定
@@ -775,7 +842,7 @@ function updateButtons() {
     const now = performance.now();
     const kana = c?.kind === "kana" && (c.phase === "streaming" || c.phase === "answering");
     const inNgDelay = !c && ngDelayUntil > now;
-    if (kana) btn("buzz").disabled = me.id in (c!.ks ?? {}) || (c!.max !== undefined && Object.keys(c!.ks ?? {}).length >= c!.max);
+    if (kana) btn("buzz").disabled = me.id in (c!.ks ?? {}) || !!c!.full;
     else btn("buzz").disabled = inNgDelay || !!g.answerer || !(g.phase === "open" && g.answerer !== me.id && !g.locked.includes(me.id) && !g.queue.includes(me.id));
 
     // NG delay visual
@@ -801,6 +868,7 @@ function syncChoice() {
   if (!c) {
     myChoice = null;
     ansQn = -1;
+    streamQn = -1;
     lastQn = -1;
     kst = null;
     kTyped = "";
@@ -840,14 +908,14 @@ function pick(i: number, e: Event) {
   const c = game?.c;
   if (!c || !me || c.kind !== "choice") return;
   if (me.host) {
-    if (c.phase === "closed") send({type: "cmd", cmd: "reveal", correct: i});
+    if (c.phase === "closed") send({ type: "cmd", cmd: "reveal", correct: i });
     return;
   }
   if (c.phase !== "answering" || myChoice !== null || c.answered.includes(me.id)) return;
   const d = e.timeStamp - ansBase;
   if (d > c.limitMs) return;
   myChoice = i;
-  send({type: "answer", choice: i, d});
+  send({ type: "answer", choice: i, d });
   renderAll();
 }
 
@@ -870,8 +938,8 @@ function onBuzz(e: Event) {
   if (c?.kind === "kana") {
     const n = Array.from(c.text ?? "").length;
     const pos = c.phase === "streaming" ? Math.min(n, Math.max(0, Math.floor((e.timeStamp - streamBase) / (c.intervalMs ?? 100)))) : n;
-    send({type: "press", pos});
-  } else send({type: "buzz", at: performance.timeOrigin + e.timeStamp + offset});
+    send({ type: "press", pos });
+  } else send({ type: "buzz", at: performance.timeOrigin + e.timeStamp + offset });
   btn("buzz").disabled = true;
 }
 

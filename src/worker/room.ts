@@ -1,15 +1,7 @@
-import {DurableObject} from "cloudflare:workers";
-import {
-  cleanNick,
-  type ClientMsg,
-  type ErrCode,
-  type LogEntry,
-  type Member,
-  PublicChoice,
-  type ServerMsg
-} from "../shared/types";
+import { DurableObject } from "cloudflare:workers";
+import { cleanNick, type ClientMsg, type ErrCode, type LogEntry, type Member, PublicChoice, type ServerMsg } from "../shared/types";
 import * as G from "./game";
-import type {HelloMsg, PublicGame} from "../shared/types";
+import type { HelloMsg, PublicGame } from "../shared/types";
 import { cleanQ, cleanScore } from "../shared/quiz";
 
 const BUZZ_WINDOW_MS = 150;
@@ -38,11 +30,11 @@ export class Room extends DurableObject<Env> {
 
   private async commit() {
     const players = this.members().filter((x) => !x.host).length;
-    const {failed} = G.sweep(this.g, Date.now(), players);
+    const { failed } = G.sweep(this.g, Date.now(), players);
     for (const id of failed) this.sendKanaTo(id);
     await this.save();
     for (const s of this.sockets()) {
-      this.send(s.ws, {type: "game", g: this.pub(s.me)});
+      this.send(s.ws, { type: "game", g: this.pub(s.me) });
     }
   }
 
@@ -78,8 +70,9 @@ export class Room extends DurableObject<Env> {
       ms: g.ms,
       c: this.pubC(me),
       res: g.res,
-      fq: me.host && g.fq ? {text: g.fq.text, answer: g.fq.ans} : null,
-      order: g.order.map((b) => b.id)
+      fq: me.host && g.fq ? { text: g.fq.text, answer: g.fq.ans } : null,
+      order: g.order.map((b) => b.id),
+      names: g.names,
     };
   }
 
@@ -119,10 +112,14 @@ export class Room extends DurableObject<Env> {
     if (!r) return null;
     const q = r.q;
     const done = r.phase === "closed" || r.phase === "revealed";
-    const full = q.type === "kana" && q.max !== undefined && Object.keys(r.prog).length >= q.max;
+    const started = Object.keys(r.prog).length;
+    const players = this.members().filter((x) => !x.host).length;
+    const full = q.type === "kana" && q.max !== undefined && started >= q.max;
     const text = q.type === "kana" && r.stopPos !== undefined && r.phase !== "revealed" ? Array.from(q.text).slice(0, r.stopPos).join("") : q.text;
-    const seeV = me.host || r.phase === "revealed" || (full && !(me.id in r.prog));
     const counts = q.type === "choice" ? (r.phase === "answering" ? q.choices.map((_, i) => Object.values(r.answers).filter((a) => a.choice === i).length) : r.counts) : undefined;
+
+    const mine = r.prog[me.id];
+    const seeAll = me.host || done || (mine ? mine.state !== "play" : full);
 
     return {
       qn: this.g.n,
@@ -137,21 +134,30 @@ export class Room extends DurableObject<Env> {
       leftMs: q.type === "choice" && r.phase === "answering" ? Math.max(0, r.deadline - Date.now()) : 0,
       startLeftMs: q.type === "kana" && r.phase === "answering" ? Math.max(0, r.deadline - Date.now()) : undefined,
       max: q.type === "kana" ? q.max : undefined,
-      ks: q.type === "kana" ? Object.fromEntries(Object.entries(r.prog).map(([id, p]) => [id, {
-        s: p.state,
-        p: p.step,
-        total: q.steps.length,
-        v: seeV ? p.cur : undefined
-      }])) : undefined,
+      full: q.type === "kana" ? full : undefined,
+      entryOpen: q.type === "kana" ? !full && started < players : undefined,
+      started: q.type === "kana" && me.host ? started : undefined,
+
+      ks:
+        q.type === "kana"
+          ? Object.fromEntries(
+              Object.entries(r.prog)
+                .filter(([id]) => seeAll || id === me.id)
+                .map(([id, p]) => [
+                  id,
+                  { s: p.state, p: p.step, total: q.steps.length, v: seeAll ? p.cur : undefined } // ← この行の v を変更
+                ])
+            )
+          : undefined,
       answered:
         q.type === "kana"
           ? Object.entries(r.prog)
-            .filter(([, p]) => p.state !== "play")
-            .map(([id]) => id)
+              .filter(([, p]) => p.state !== "play")
+              .map(([id]) => id)
           : Object.keys(r.answers),
       counts: q.type === "choice" && (done || me.host) ? counts : undefined,
       correct: q.type === "choice" && (r.phase === "revealed" || me.host) ? q.correct : undefined,
-      answer: r.phase === "revealed" ? (q.ans ?? (q.type === "kana" ? q.steps.map((s) => s.correct).join("") : undefined)) : undefined,
+      answer: r.phase === "revealed" ? (q.type === "kana" ? ((t) => (q.ans && q.ans !== t ? `${q.ans}(${t})` : (q.ans ?? t)))(q.steps.map((s) => s.correct).join("")) : q.ans) : undefined,
       results: r.phase === "revealed" ? r.results : undefined
     };
   }
@@ -183,10 +189,10 @@ export class Room extends DurableObject<Env> {
 
   // accept WS (Hibernation API); attachment = Member | null (null = not joined)
   async fetch(_req: Request): Promise<Response> {
-    const {0: client, 1: server} = new WebSocketPair();
+    const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment(null);
-    return new Response(null, {status: 101, webSocket: client});
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer) {
@@ -205,7 +211,7 @@ export class Room extends DurableObject<Env> {
     const now = Date.now();
     switch (m.type) {
       case "ping":
-        this.send(ws, {type: "pong", t0: m.t0, ts: now});
+        this.send(ws, { type: "pong", t0: m.t0, ts: now });
         return;
       case "start":
         if (!me.host) return;
@@ -219,6 +225,26 @@ export class Room extends DurableObject<Env> {
         G.end(this.g);
         this.clearCTimer();
         break;
+      case "revive":
+        if (!me.host) return;
+        G.revive(this.g);
+        break;
+      case "reset":
+        if (!me.host) return;
+        this.clearTimer();
+        this.clearCTimer();
+        G.reset(this.g, m.what === "all", new Set(this.members().map((x) => x.id)));
+
+        break;
+      case "setScore": {
+        if (!me.host) return;
+        const t = this.members().find((x) => x.id === m.id && !x.host) ?? (m.id in this.g.names ? { id: m.id } : undefined);
+
+        const ok = (v: unknown, lim: number) => typeof v === "number" && Number.isFinite(v) && Math.abs(v) <= lim;
+        if (!t || !ok(m.sc, 999999) || !ok(m.pts, 9999) || !ok(m.ms, 86400000)) return;
+        G.setScore(this.g, t.id, Math.round(m.sc), Math.max(0, Math.round(m.pts)), Math.max(0, Math.round(m.ms)));
+        break;
+      }
       case "judge":
         if (!me.host) return;
         G.judge(this.g, m.ok, cleanScore(m.score));
@@ -261,7 +287,7 @@ export class Room extends DurableObject<Env> {
         if (me.host) return;
         const p = G.press(this.g, me.id, m.pos, now);
         if (!p) {
-          this.send(ws, { type: "game", g: this.pub(me) }); // rejected: resync
+          this.send(ws, { type: "game", g: this.pub(me) }); // rejected (full etc.): resync this client
           return;
         }
         this.sendKana(ws, p);
@@ -295,8 +321,7 @@ export class Room extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket) {
     try {
       ws.close();
-    } catch {
-    }
+    } catch {}
     await this.leave(ws);
   }
 
@@ -314,7 +339,7 @@ export class Room extends DurableObject<Env> {
     let newHostKey: string | undefined;
     if (m.mode === "create") {
       if (meta) return this.fail(ws, "exists");
-      meta = {hostKey: crypto.randomUUID(), createdAt: Date.now()};
+      meta = { hostKey: crypto.randomUUID(), createdAt: Date.now() };
       await this.ctx.storage.put("meta", meta);
       newHostKey = meta.hostKey;
     } else if (!meta) return this.fail(ws, "no_room");
@@ -328,14 +353,19 @@ export class Room extends DurableObject<Env> {
       s.ws.close(4000, "replaced");
     }
 
-    const you: Member = {id: m.id, nick, host: m.mode === "create" || m.hostKey === meta.hostKey};
+    const you: Member = { id: m.id, nick, host: m.mode === "create" || m.hostKey === meta.hostKey };
     ws.serializeAttachment(you);
-    this.send(ws, {type: "welcome", you, members: this.members(), game: this.pub(you), hostKey: newHostKey});
+    if (!you.host && this.g.names[you.id] !== nick) {
+      this.g.names[you.id] = nick;
+      await this.save();
+    } // remember for after leaving
+
+    this.send(ws, { type: "welcome", you, members: this.members(), game: this.pub(you), hostKey: newHostKey });
     if (!you.host) {
       const p = G.progOf(this.g, you.id);
       if (p) this.sendKana(ws, p);
     }
-    if (old.length === 0) this.broadcast({type: "join", member: you, t: Date.now()}, ws);
+    if (old.length === 0) this.broadcast({ type: "join", member: you, t: Date.now() }, ws);
   }
 
   private async leave(ws: WebSocket) {
@@ -343,7 +373,7 @@ export class Room extends DurableObject<Env> {
     if (!me) return;
     ws.serializeAttachment(null);
     if (this.sockets().some((s) => s.me.id === me.id)) return;
-    this.broadcast({type: "leave", id: me.id, nick: me.nick, t: Date.now()});
+    this.broadcast({ type: "leave", id: me.id, nick: me.nick, t: Date.now() });
     G.drop(this.g, me.id);
     await this.commit();
   }
@@ -351,7 +381,7 @@ export class Room extends DurableObject<Env> {
   private sockets() {
     return this.ctx
       .getWebSockets()
-      .map((ws) => ({ws, me: ws.deserializeAttachment() as Member | null}))
+      .map((ws) => ({ ws, me: ws.deserializeAttachment() as Member | null }))
       .filter((s): s is { ws: WebSocket; me: Member } => s.me !== null);
   }
 
@@ -362,8 +392,7 @@ export class Room extends DurableObject<Env> {
   private send(ws: WebSocket, m: ServerMsg) {
     try {
       ws.send(JSON.stringify(m));
-    } catch {
-    }
+    } catch {}
   }
 
   private broadcast(m: ServerMsg, except?: WebSocket) {
@@ -371,7 +400,7 @@ export class Room extends DurableObject<Env> {
   }
 
   private fail(ws: WebSocket, code: ErrCode) {
-    this.send(ws, {type: "error", code});
+    this.send(ws, { type: "error", code });
     ws.close(4001, code);
   }
 }

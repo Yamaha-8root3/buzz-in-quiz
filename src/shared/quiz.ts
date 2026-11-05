@@ -35,6 +35,7 @@ export interface KanaQ {
   max?: number; // max answerers (undefined = unlimited)
   steps: KanaStep[];
   scores: number[]; // points by rank among correct answerers (out of range = last)
+  penalty: number;
 }
 
 export type RunQ = ChoiceQ | KanaQ; // runs inside game.c
@@ -49,7 +50,8 @@ export interface RoomSettings {
   choiceMs: number;
   choiceScore: number;
   kanaScores: number[];
-  freeScore: number
+  freeScore: number;
+  kanaPenalty: number;
 }
 
 export const DEFAULT_SETTINGS: RoomSettings = {
@@ -60,7 +62,8 @@ export const DEFAULT_SETTINGS: RoomSettings = {
   choiceMs: 10000,
   choiceScore: 10,
   kanaScores: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
-  freeScore: 10
+  freeScore: 10,
+  kanaPenalty: 0
 };
 
 const pt = (v: unknown, d: number) => (Number.isInteger(v) && Math.abs(v as number) <= 9999 ? (v as number) : d);
@@ -81,21 +84,15 @@ export function cleanSettings(x: Partial<Record<keyof RoomSettings, unknown>>): 
     choiceScore: pt(x.choiceScore, d.choiceScore),
     kanaScores: pl(x.kanaScores, d.kanaScores),
     freeScore: pt(x.freeScore, d.freeScore),
+    kanaPenalty: Math.abs(pt(x.kanaPenalty, d.kanaPenalty))
   };
 }
 
 // fill in timing / limits right before sending
 export function applySettings(q: Q, s: RoomSettings): Q {
-  if (q.type === "kana") return {
-    ...q,
-    intervalMs: s.intervalMs,
-    startMs: s.startMs,
-    firstMs: s.firstMs,
-    nextMs: s.nextMs,
-    max: s.max,
-    scores: s.kanaScores
-  };
-  if (q.type === "choice") return {...q, limitMs: s.choiceMs, score: s.choiceScore};
+  if (q.type === "kana") return { ...q, intervalMs: s.intervalMs, startMs: s.startMs, firstMs: s.firstMs, nextMs: s.nextMs, max: s.max, scores: s.kanaScores, penalty: s.kanaPenalty };
+
+  if (q.type === "choice") return { ...q, limitMs: s.choiceMs, score: s.choiceScore };
   return q;
 }
 
@@ -111,7 +108,7 @@ export function cleanQ(x: unknown): Q | null {
 export function cleanFreeQ(x: unknown): FreeQ | null {
   const q = x as Partial<FreeQ> | null;
   if (!q || typeof q.id !== "string") return null;
-  return {id: q.id.slice(0, 64), type: "free", text: str(q.text, 500), ans: str(q.ans, 200)};
+  return { id: q.id.slice(0, 64), type: "free", text: str(q.text, 500), ans: str(q.ans, 200) };
 }
 
 export function cleanChoiceQ(x: unknown): ChoiceQ | null {
@@ -128,7 +125,8 @@ export function cleanChoiceQ(x: unknown): ChoiceQ | null {
     ans: str(q.ans, 200),
     choices: cs.map((s) => s.trim()),
     correct: q.correct!,
-    limitMs: q.limitMs, score: pt(q.score, DEFAULT_SETTINGS.choiceScore)
+    limitMs: q.limitMs,
+    score: pt(q.score, DEFAULT_SETTINGS.choiceScore)
   };
 }
 
@@ -145,7 +143,7 @@ export function cleanKanaQ(x: unknown): KanaQ | null {
     const d = s?.dummies;
     if (!one(s?.correct) || !Array.isArray(d) || d.length !== 3 || !d.every(one)) return null;
     if (new Set([s.correct, ...d]).size !== 4) return null;
-    steps.push({correct: s.correct, dummies: [d[0], d[1], d[2]]});
+    steps.push({ correct: s.correct, dummies: [d[0], d[1], d[2]] });
   }
   return {
     id: q.id.slice(0, 64),
@@ -158,7 +156,8 @@ export function cleanKanaQ(x: unknown): KanaQ | null {
     nextMs: q.nextMs,
     max: q.max,
     steps,
-    scores: pl(q.scores, DEFAULT_SETTINGS.kanaScores)
+    scores: pl(q.scores, DEFAULT_SETTINGS.kanaScores),
+    penalty: Math.abs(pt(q.penalty, 0))
   };
 }
 
@@ -177,30 +176,35 @@ const list = (s: string) =>
     .filter(Boolean);
 
 export function parseCsv(src: string): string[][] {
-  return src.replace(/^\uFEFF/, "").split(/\r\n|\n|\r/).map((line) => {
-    const row: string[] = [];
-    let f = "", inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (inQ) {
-        if (ch !== '"') f += ch;
-        else if (line[i + 1] === '"') {
-          f += '"';
-          i++;
-        } else inQ = false;
-      } else if (ch === '"') inQ = true;
-      else if (ch === ",") {
-        row.push(f);
-        f = "";
-      } else f += ch;
-    }
-    row.push(f);
-    return row;
-  });
+  return src
+    .replace(/^\uFEFF/, "")
+    .split(/\r\n|\n|\r/)
+    .map((line) => {
+      const row: string[] = [];
+      let f = "",
+        inQ = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (inQ) {
+          if (ch !== '"') f += ch;
+          else if (line[i + 1] === '"') {
+            f += '"';
+            i++;
+          } else inQ = false;
+        } else if (ch === '"') inQ = true;
+        else if (ch === ",") {
+          row.push(f);
+          f = "";
+        } else f += ch;
+      }
+      row.push(f);
+      return row;
+    });
 }
 
 export function csvToQs(src: string): { qs: Q[]; errs: string[] } {
-  const qs: Q[] = [], errs: string[] = [];
+  const qs: Q[] = [],
+    errs: string[] = [];
   parseCsv(src).forEach((r, i) => {
     if (i === 0 || !r.some((x) => x.trim())) return; // header / blank line
     const c = (n: number) => (r[n] ?? "").trim();
@@ -213,7 +217,7 @@ export function csvToQs(src: string): { qs: Q[]; errs: string[] } {
       const dm = [...c(4 + k).replace(/\s/g, "")];
       if (dm.length !== 3) return err(`${k + 1}文字目のダミーが3文字ではありません`);
       if (new Set([chars[k], ...dm]).size !== 4) return err(`${k + 1}文字目「${chars[k]}」: ダミー「${dm.join("")}」に正解文字または重複があります`);
-      steps.push({correct: chars[k], dummies: dm});
+      steps.push({ correct: chars[k], dummies: dm });
     }
     const q = cleanQ({
       id: crypto.randomUUID(),
@@ -226,7 +230,8 @@ export function csvToQs(src: string): { qs: Q[]; errs: string[] } {
       nextMs: d.nextMs,
       steps
     });
-    if (q) qs.push(q); else err("内容が不正 (問題文なし / 文字の重複)");
+    if (q) qs.push(q);
+    else err("内容が不正 (問題文なし / 文字の重複)");
   });
-  return {qs, errs};
+  return { qs, errs };
 }
